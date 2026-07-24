@@ -103,10 +103,10 @@ so partial progress survives timeouts.
 ## Install
 
 ```bash
-# One-shot, no clone (after first PyPI release):
-uvx ml-agent-orchestrator --help          # runs the ml-orchestrator CLI
+# One-shot from PyPI, no clone, no venv:
+uvx ml-agent-orchestrator --help          # `ml-orchestrator` also works
 
-# Or straight from GitHub today:
+# Or straight from GitHub:
 uvx --from git+https://github.com/1to3for5vi7ate9x/multi-agent-orchestrator \
     ml-orchestrator --help
 

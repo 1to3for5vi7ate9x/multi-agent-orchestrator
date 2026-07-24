@@ -1,6 +1,6 @@
 [project]
 name = "ml-agent-orchestrator"
-version = "0.4.0"
+version = "0.4.1"
 description = "Closed-loop automated ML experiment engine driven by Claude Code (editor) and Google Antigravity CLI (evaluator), with git-based state decisions, persistent agent sessions, context-rotation memory, an AST code graph and a temporal experiment knowledge graph."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,9 @@ torch = ["torch>=2.1"]
 
 [project.scripts]
 ml-orchestrator = "ml_orchestrator.main:main"
+# Same CLI under the package's own name, so bare `uvx ml-agent-orchestrator`
+# works without --from.
+ml-agent-orchestrator = "ml_orchestrator.main:main"
 
 [project.urls]
 Homepage = "https://github.com/1to3for5vi7ate9x/multi-agent-orchestrator"
