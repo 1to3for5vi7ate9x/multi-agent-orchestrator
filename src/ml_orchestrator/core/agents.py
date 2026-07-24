@@ -143,30 +143,62 @@ class ClaudeEditor(_CLIAgent):
         diagnostic: str = "",
         history_summary: str = "",
         knowledge_context: str = "",
+        mode: str = "ml",
+        eval_command: str = "",
     ) -> str:
+        if mode == "coding":
+            role = (
+                "You are the Code Editor in an automated development loop. "
+                "Your ONLY job in this turn is to edit the local source "
+                "files so the evaluation command gets closer to fully "
+                "passing."
+            )
+            constraints = [
+                "\n## Hard constraints",
+                f"- The objective is measured by running: `{eval_command}`. "
+                "Your edits must reduce its failures / make it pass.",
+                "- Do NOT modify test files, test fixtures, or the "
+                "evaluation command itself unless the goal explicitly asks "
+                "for it — fixing the code, not the test, is the job.",
+                "- Edit files in place. Do NOT create new entrypoints or "
+                "rename files.",
+                "- Do not install packages or touch git; the orchestrator "
+                "handles versioning.",
+                "- Make ONE focused, hypothesis-driven change set per trial "
+                "rather than many unrelated edits.",
+            ]
+        else:
+            role = (
+                "You are the Model & Experiment Editor in an automated ML "
+                "experimentation loop. Your ONLY job in this turn is to "
+                "edit the local source files to improve the next training "
+                "run."
+            )
+            constraints = [
+                "\n## Hard constraints",
+                "- Edit files in place. Do NOT create new entrypoints or "
+                "rename files.",
+                f"- `{train_script}` must remain directly runnable via "
+                f"`python {train_script}` with no new CLI arguments "
+                "required.",
+                "- The script MUST keep writing progress to `metrics.json` "
+                "in the working directory with at least: "
+                '{"epoch": N, "train_loss": X, "val_loss": Y, "status": '
+                '"COMPLETED"}.',
+                "- Do not install packages or touch git; the orchestrator "
+                "handles versioning.",
+                "- Make ONE focused, hypothesis-driven change set per "
+                "trial (e.g. adjust LR schedule, change capacity, add "
+                "regularization) rather than many unrelated edits.",
+            ]
         sections = [
-            "You are the Model & Experiment Editor in an automated ML "
-            "experimentation loop. Your ONLY job in this turn is to edit the "
-            "local source files to improve the next training run.",
+            role,
             "",
             f"## Target goal\n{goal}",
             f"\n## Current trial\nTrial {trial}.",
             "\n## Files you may edit\n"
             + "\n".join(f"- {f}" for f in editable_files),
-            "\n## Hard constraints",
-            "- Edit files in place. Do NOT create new entrypoints or rename "
-            "files.",
-            f"- `{train_script}` must remain directly runnable via "
-            f"`python {train_script}` with no new CLI arguments required.",
-            "- The script MUST keep writing progress to `metrics.json` in "
-            "the working directory with at least: "
-            '{"epoch": N, "train_loss": X, "val_loss": Y, "status": '
-            '"COMPLETED"}.',
-            "- Do not install packages or touch git; the orchestrator "
-            "handles versioning.",
-            "- Make ONE focused, hypothesis-driven change set per trial "
-            "(e.g. adjust LR schedule, change capacity, add regularization) "
-            "rather than many unrelated edits.",
+            *constraints,
         ]
         if knowledge_context:
             sections.append(
@@ -228,10 +260,32 @@ class AntigravityEvaluator(_CLIAgent):
         crash_diagnostic: str = "",
         change_summary: str = "",
         knowledge_context: str = "",
+        mode: str = "ml",
+        eval_command: str = "",
     ) -> str:
         metrics_json = json.dumps(metrics, indent=2) if metrics else "null"
         best_json = json.dumps(best_metrics, indent=2) if best_metrics else "null"
         crashed = bool(crash_diagnostic)
+        if mode == "coding":
+            analysis_focus = (
+                "Analyze the latest evaluation run: which tests/checks "
+                f"pass or fail (command: `{eval_command}`), what the "
+                "failure messages imply about root causes, and whether "
+                "the trend across trials is converging toward a fully "
+                "passing suite."
+            )
+            goal_rule = ("the evaluation command fully passes (0 failures) "
+                         "or the stated objective is otherwise objectively "
+                         "satisfied")
+        else:
+            analysis_focus = (
+                "Analyze the latest training run scientifically: loss "
+                "curves, convergence rate, train/val gap (overfitting), "
+                "variance/instability, and GPU memory behavior if reported."
+            )
+            goal_rule = ("the stated target goal is objectively satisfied "
+                         "by the latest metrics (and not by an obviously "
+                         "divergent/overfit fluke)")
         changes_block = (
             f"\n## Exact code changes made this trial (AST diff)\n"
             f"{change_summary.strip()}\n" if change_summary.strip() else ""
@@ -240,8 +294,8 @@ class AntigravityEvaluator(_CLIAgent):
             f"\n{knowledge_context.strip()}\n" if knowledge_context.strip() else ""
         )
 
-        return f"""You are the Research & Evaluation Specialist in an automated ML experimentation loop.
-Analyze the latest training run scientifically: loss curves, convergence rate, train/val gap (overfitting), variance/instability, and GPU memory behavior if reported.
+        return f"""You are the Research & Evaluation Specialist in an automated experimentation loop.
+{analysis_focus}
 
 ## Target goal
 {goal}
@@ -272,10 +326,10 @@ Analyze the latest training run scientifically: loss curves, convergence rate, t
 ```
 
 ## Decision rules
-- GOAL_REACHED : the stated target goal is objectively satisfied by the latest metrics (and not by an obviously divergent/overfit fluke).
-- IMPROVED     : latest val_loss is better than the best so far (or clearly better dynamics), but the goal is not yet met.
+- GOAL_REACHED : {goal_rule}.
+- IMPROVED     : the latest objective score is better than the best so far (or clearly better dynamics), but the goal is not yet met.
 - REGRESSED    : run completed but performance is worse than / not better than the best so far.
-- CRASHED      : the run failed to complete.
+- CRASHED      : the run failed to complete / produced no measurable result.
 
 ## Response format — respond with EXACTLY these three lines and nothing else
 STATUS: [GOAL_REACHED | IMPROVED | REGRESSED | CRASHED]
@@ -351,14 +405,29 @@ def heuristic_evaluation(
     best_val_loss: Optional[float],
     crashed: bool,
     error_type: Optional[str] = None,
+    direction: str = "minimize",
+    goal_op: str = "<",
 ) -> EvaluationResult:
     """Purely numeric verdict used when the Antigravity CLI is unavailable
-    or returns an unparseable reply. Keeps the loop functional."""
-    if crashed or val_loss is None:
+    or returns an unparseable reply. Keeps the loop functional.
+
+    ``val_loss``/``best_val_loss`` are the generic objective scores
+    (names kept for backward compatibility); comparisons honor
+    *direction* and *goal_op*.
+    """
+    score, best = val_loss, best_val_loss
+
+    def better(a: float, b: float) -> bool:
+        return a < b if direction == "minimize" else a > b
+
+    def met(s: float, t: float) -> bool:
+        return {"<": s < t, "<=": s <= t, ">": s > t, ">=": s >= t}[goal_op]
+
+    if crashed or score is None:
         return EvaluationResult(
             status=STATUS_CRASHED,
             reasoning=(
-                f"Run failed before producing valid metrics "
+                f"Run failed before producing a measurable objective "
                 f"(error class: {error_type or 'unknown'})."
             ),
             recommendations=(
@@ -367,39 +436,39 @@ def heuristic_evaluation(
             ),
             source="heuristic-fallback",
         )
-    if goal_target is not None and val_loss < goal_target:
+    if goal_target is not None and met(score, goal_target):
         return EvaluationResult(
             status=STATUS_GOAL_REACHED,
             reasoning=(
-                f"val_loss={val_loss:.4f} is below the parsed numeric "
-                f"target {goal_target:.4f}."
+                f"score={score:.4f} satisfies the numeric goal condition "
+                f"(score {goal_op} {goal_target:.4f})."
             ),
             recommendations="Goal satisfied; no further edits required.",
             source="heuristic-fallback",
         )
-    if best_val_loss is None or val_loss < best_val_loss:
+    if best is None or better(score, best):
         return EvaluationResult(
             status=STATUS_IMPROVED,
             reasoning=(
-                f"val_loss improved to {val_loss:.4f} "
+                f"Objective improved to {score:.4f} "
                 f"(previous best: "
-                f"{'n/a' if best_val_loss is None else f'{best_val_loss:.4f}'})."
+                f"{'n/a' if best is None else f'{best:.4f}'})."
             ),
             recommendations=(
-                "Continue in the same direction; consider a finer learning-"
-                "rate adjustment or mild regularization next."
+                "Continue in the same direction with a finer, focused "
+                "adjustment next."
             ),
             source="heuristic-fallback",
         )
     return EvaluationResult(
         status=STATUS_REGRESSED,
         reasoning=(
-            f"val_loss={val_loss:.4f} did not beat the best so far "
-            f"({best_val_loss:.4f})."
+            f"score={score:.4f} did not beat the best so far "
+            f"({best:.4f})."
         ),
         recommendations=(
             "Revert conceptually and try an orthogonal change (different "
-            "hyperparameter family or architectural tweak)."
+            "approach or subsystem)."
         ),
         source="heuristic-fallback",
     )
@@ -411,15 +480,18 @@ def parse_goal_target(goal: str) -> Optional[float]:
     Understands phrasings like 'validation loss < 0.25', 'val_loss below
     0.3', 'val loss under 0.25'. Returns None if no target is found.
     """
-    m = re.search(
+    patterns = [
         r"val(?:idation)?[\s_]*loss\s*(?:<=?|under|below|less than)\s*"
         r"([0-9]*\.?[0-9]+)",
-        goal,
-        re.IGNORECASE,
-    )
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
+        r"\bscore\s*(?:<=?|>=?|under|below|above|over|at least|less than)\s*"
+        r"([0-9]*\.?[0-9]+)",
+        r"\bloss\s*(?:<=?|under|below|less than)\s*([0-9]*\.?[0-9]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, goal, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
     return None

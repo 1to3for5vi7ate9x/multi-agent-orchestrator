@@ -168,15 +168,20 @@ class GitManager:
         trial: int,
         val_loss: Optional[float],
         note: str = "",
+        metric_name: str = "val_loss",
     ) -> Optional[str]:
         """Commit all current changes with the structured trial message.
+
+        ``val_loss`` is the generic objective value (name kept for
+        backward compatibility); ``metric_name`` labels it in the commit
+        message (e.g. val_loss, score, failing_tests).
 
         Returns the commit hash, or None when there was nothing to commit.
         """
         if not self.is_dirty():
             return self.head_commit()
         loss_str = f"{val_loss:.4f}" if val_loss is not None else "n/a"
-        message = f"experiment(trial-{trial}): val_loss={loss_str}"
+        message = f"experiment(trial-{trial}): {metric_name}={loss_str}"
         if note:
             message += f"\n\n{note}"
         self._git("add", "-A")

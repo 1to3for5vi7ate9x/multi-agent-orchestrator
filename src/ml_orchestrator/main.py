@@ -16,17 +16,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
+from importlib import resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from core import (
+from .core import (
     AgentError,
     AntigravityEvaluator,
     ClaudeEditor,
     ExecutionHarness,
     ExperimentLogger,
+    FitnessExtractor,
+    FitnessResult,
     GitError,
     GitManager,
     STATUS_CRASHED,
@@ -34,16 +38,39 @@ from core import (
     STATUS_IMPROVED,
     STATUS_REGRESSED,
 )
-from core import CodeGraph, ExperimentKnowledgeGraph, format_changes
-from core.agents import heuristic_evaluation, parse_goal_target
-from core.git_manager import DEFAULT_IGNORES
-from core.runner import ExecutionHarness as Harness  # alias for clarity
-from core.session import (
+from .core import CodeGraph, ExperimentKnowledgeGraph, format_changes
+from .core.agents import heuristic_evaluation, parse_goal_target
+from .core.git_manager import DEFAULT_IGNORES
+from .core.runner import ExecutionHarness as Harness  # alias for clarity
+from .core.session import (
     AntigravitySessionAdapter,
     ClaudeSessionAdapter,
     ManagedSession,
     MemoryStore,
 )
+
+# ---------------------------------------------------------------------------
+# Presets: how the objective is defined and judged
+# ---------------------------------------------------------------------------
+
+PRESETS: Dict[str, Dict[str, Any]] = {
+    # Classic ML experimentation: minimize val_loss from metrics.json.
+    "ml": {
+        "direction": "minimize",
+        "goal_op": "<",
+        "metric_name": "val_loss",
+        "default_goal_target": None,       # parsed from the goal text
+        "allow_exit_code_score": False,    # missing metrics = crash
+    },
+    # General/vibe coding: minimize failing tests; 0 failures = goal.
+    "coding": {
+        "direction": "minimize",
+        "goal_op": "<=",
+        "metric_name": "failing_tests",
+        "default_goal_target": 0.0,
+        "allow_exit_code_score": True,     # clean exit w/o tests counts as pass
+    },
+}
 
 # --------------------------------------------------------------------------
 # Terminal UI — uses `rich` when available, plain ANSI otherwise
@@ -83,7 +110,8 @@ try:
         ):
             table.add_column(col, justify=justify)
         for t in trials:
-            val = t.get("val_loss")
+            val = t.get("score") if t.get("score") is not None \
+                else t.get("val_loss")
             table.add_row(
                 str(t["trial"]),
                 t["status"],
@@ -117,10 +145,11 @@ except ImportError:  # graceful ANSI fallback
         print(f"{_C['red']}  ✘ {text}{_C['end']}")
 
     def print_trial_table(trials: List[Dict[str, Any]]) -> None:
-        print(f"\n{'Trial':>5} {'Status':<14} {'val_loss':>10} "
+        print(f"\n{'Trial':>5} {'Status':<14} {'score':>10} "
               f"{'Action':<12} Commit")
         for t in trials:
-            val = t.get("val_loss")
+            val = t.get("score") if t.get("score") is not None \
+                else t.get("val_loss")
             val_s = f"{val:.4f}" if isinstance(val, (int, float)) else "n/a"
             print(f"{t['trial']:>5} {t['status']:<14} {val_s:>10} "
                   f"{t['action']:<12} {(t.get('commit') or 'n/a')[:8]}")
@@ -139,7 +168,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--goal", required=True,
                    help="Target objective, e.g. 'Achieve validation loss "
-                        "< 0.25 without overfitting'.")
+                        "< 0.25 without overfitting' or 'Make the whole "
+                        "test suite pass'.")
+    p.add_argument("--preset", choices=sorted(PRESETS), default="ml",
+                   help="Objective preset: 'ml' minimizes val_loss/score "
+                        "from metrics.json; 'coding' minimizes failing "
+                        "tests from --eval-command output (goal: 0).")
+    p.add_argument("--eval-command", default=None,
+                   help="Shell command that measures the objective each "
+                        "trial (e.g. 'pytest -q', 'npm test'). Default: "
+                        "'<python> <train-script>' for the ml preset; "
+                        "auto-detected test runner for the coding preset.")
+    p.add_argument("--direction", choices=["minimize", "maximize"],
+                   default=None,
+                   help="Whether a lower or higher score is better "
+                        "(default: from --preset).")
+    p.add_argument("--goal-target", type=float, default=None,
+                   help="Explicit numeric goal target for the score "
+                        "(default: parsed from --goal, or the preset's "
+                        "default).")
+    p.add_argument("--scaffold-demo", action="store_true",
+                   help="Copy the bundled demo train.py/model_example.py "
+                        "into --workdir before starting (self-contained "
+                        "try-out, no repo clone needed).")
     p.add_argument("--max-trials", type=int, default=5,
                    help="Maximum number of edit->train->evaluate iterations.")
     p.add_argument("--train-script", default="train.py",
@@ -194,6 +245,43 @@ def build_parser() -> argparse.ArgumentParser:
 # Helpers
 # --------------------------------------------------------------------------
 
+def scaffold_demo(workdir: Path) -> List[str]:
+    """Copy the bundled demo templates into *workdir*. Returns filenames."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    pkg = resources.files("ml_orchestrator") / "templates"
+    written = []
+    for src_name, dst_name in (("train_example.py", "train.py"),
+                               ("model_example.py", "model_example.py")):
+        dst = workdir / dst_name
+        if not dst.exists():
+            dst.write_text((pkg / src_name).read_text(encoding="utf-8"),
+                           encoding="utf-8")
+            written.append(dst_name)
+    return written
+
+
+def build_eval_command(args, preset: Dict[str, Any],
+                       workdir: Path) -> Optional[List[str]]:
+    """Resolve the command that measures the objective each trial.
+
+    Returns an argv list, or None when nothing sensible can be built.
+    """
+    if args.eval_command:
+        shell = ["cmd", "/c"] if os.name == "nt" else ["/bin/sh", "-c"]
+        return shell + [args.eval_command]
+    if args.preset == "coding":
+        # Auto-detect a test runner in the workspace.
+        if any((workdir / f).exists() for f in
+               ("pytest.ini", "pyproject.toml", "setup.cfg", "tests",
+                "conftest.py")):
+            return [args.python, "-m", "pytest", "-q"]
+        if (workdir / "package.json").exists():
+            shell = ["cmd", "/c"] if os.name == "nt" else ["/bin/sh", "-c"]
+            return shell + ["npm test --silent"]
+        return None
+    return [args.python, args.train_script]
+
+
 def read_metrics(path: Path) -> Optional[Dict[str, Any]]:
     """Load and minimally validate metrics.json. Returns None if unusable."""
     if not path.exists():
@@ -229,21 +317,24 @@ def default_editable_files(workdir: Path, train_script: str) -> List[str]:
     return files
 
 
-def run_training(
+def run_evaluation(
     harness: ExecutionHarness,
-    python: str,
-    train_script: str,
+    command: List[str],
     metrics_path: Path,
     timeout: float,
+    fitness: FitnessExtractor,
 ):
-    """Delete stale metrics, run the script, return (result, metrics)."""
+    """Delete stale metrics, run the eval command, extract fitness.
+
+    Returns (ExecutionResult, FitnessResult).
+    """
     try:
         metrics_path.unlink(missing_ok=True)
     except OSError as exc:
         warn(f"Could not remove stale metrics file: {exc}")
-    result = harness.run([python, train_script], timeout=timeout)
-    metrics = read_metrics(metrics_path)
-    return result, metrics
+    result = harness.run(command, timeout=timeout)
+    fit = fitness.extract(result)
+    return result, fit
 
 
 def evaluate_run(
@@ -260,6 +351,12 @@ def evaluate_run(
     error_type: Optional[str],
     change_summary: str = "",
     knowledge_context: str = "",
+    mode: str = "ml",
+    eval_command_display: str = "",
+    score: Optional[float] = None,
+    best_score: Optional[float] = None,
+    direction: str = "minimize",
+    goal_op: str = "<",
 ):
     """Antigravity verdict with a numeric-heuristic safety net."""
     if evaluator is not None:
@@ -274,6 +371,8 @@ def evaluate_run(
                 crash_diagnostic=crash_diagnostic,
                 change_summary=change_summary,
                 knowledge_context=knowledge_context,
+                mode=mode,
+                eval_command=eval_command_display,
             )
             # Sanity-guard: never let a hallucinated verdict contradict a
             # hard crash — a run without metrics cannot have improved.
@@ -286,9 +385,9 @@ def evaluate_run(
         except AgentError as exc:
             warn(f"Antigravity evaluation failed ({exc}); "
                  "using numeric fallback.")
-    val = (metrics or {}).get("val_loss")
-    best = (best_metrics or {}).get("val_loss")
-    return heuristic_evaluation(goal_target, val, best, crashed, error_type)
+    return heuristic_evaluation(goal_target, score, best_score, crashed,
+                                error_type, direction=direction,
+                                goal_op=goal_op)
 
 
 def format_feedback(evaluation) -> str:
@@ -306,24 +405,47 @@ def format_feedback(evaluation) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     workdir = Path(args.workdir).resolve()
+    preset = PRESETS[args.preset]
+    direction = args.direction or preset["direction"]
+    metric_name = preset["metric_name"]
 
     banner("ml-agent-orchestrator\n"
            f"Goal: {args.goal}\n"
+           f"Preset: {args.preset} ({direction} {metric_name})\n"
            f"Workspace: {workdir}")
 
     # ---- Phase 0: environment & workspace checks --------------------------
     phase("Phase 0 — Initialization")
 
+    if args.scaffold_demo:
+        written = scaffold_demo(workdir)
+        if written:
+            success(f"Scaffolded demo files into {workdir}: "
+                    f"{', '.join(written)}")
+        else:
+            info("Demo files already present; scaffold skipped.")
     if not workdir.exists():
         error(f"Workspace {workdir} does not exist.")
         return 2
-    train_path = workdir / args.train_script
-    if not train_path.exists():
-        error(f"Training script not found: {train_path}")
-        info("Tip: copy templates/train_example.py and "
-             "templates/model_example.py into the workspace to try the "
-             "framework end to end.")
+
+    eval_command = build_eval_command(args, preset, workdir)
+    if eval_command is None:
+        error("Could not determine an evaluation command for the coding "
+              "preset. Pass one explicitly, e.g. "
+              "--eval-command 'pytest -q' or --eval-command 'npm test'.")
         return 2
+    eval_command_display = args.eval_command or " ".join(
+        eval_command[-1:] if eval_command[0] in ("/bin/sh", "cmd")
+        else eval_command)
+
+    if args.preset == "ml" and not args.eval_command:
+        train_path = workdir / args.train_script
+        if not train_path.exists():
+            error(f"Training script not found: {train_path}")
+            info("Tip: run with --scaffold-demo to drop a working demo "
+                 "train.py/model_example.py into the workspace.")
+            return 2
+    info(f"Evaluation command: {eval_command_display}")
 
     git = GitManager(workdir)
     try:
@@ -442,9 +564,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     harness = ExecutionHarness(cwd=workdir, echo=not args.no_echo)
     metrics_path = workdir / args.metrics_file
+    fitness = FitnessExtractor(
+        metrics_path=metrics_path,
+        direction=direction,
+        goal_op=preset["goal_op"],
+        allow_exit_code_score=preset["allow_exit_code_score"],
+    )
     logger = ExperimentLogger(workdir / "experiments_history.json")
     session_id = logger.start_session(args.goal, {
         "max_trials": args.max_trials,
+        "preset": args.preset,
+        "direction": direction,
+        "metric_name": metric_name,
+        "eval_command": eval_command_display,
         "train_script": args.train_script,
         "timeout": args.timeout,
         "metrics_file": args.metrics_file,
@@ -453,11 +585,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     })
     info(f"Session {session_id} started; history -> experiments_history.json")
 
-    goal_target = parse_goal_target(args.goal)
+    goal_target = args.goal_target
+    if goal_target is None:
+        goal_target = parse_goal_target(args.goal)
+    if goal_target is None:
+        goal_target = preset["default_goal_target"]
     if goal_target is not None:
-        info(f"Parsed numeric goal target: val_loss < {goal_target}")
+        info(f"Numeric goal condition: {metric_name} "
+             f"{preset['goal_op']} {goal_target}")
 
     best_metrics: Optional[Dict[str, Any]] = None
+    best_score: Optional[float] = None
     best_commit: Optional[str] = git.head_commit()
     pending_feedback = ""
     pending_diagnostic = ""
@@ -465,26 +603,25 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- Phase 0.5: baseline run ------------------------------------------
     if not args.skip_baseline:
-        phase("Trial 0 — Baseline training run")
-        result, metrics = run_training(
-            harness, args.python, args.train_script, metrics_path,
-            args.timeout,
+        phase("Trial 0 — Baseline evaluation run")
+        result, fit = run_evaluation(
+            harness, eval_command, metrics_path, args.timeout, fitness,
         )
-        if result.succeeded and metrics and metrics.get("val_loss") is not None:
-            best_metrics = metrics
-            success(f"Baseline established: val_loss="
-                    f"{metrics['val_loss']:.4f} "
-                    f"({result.duration_seconds:.1f}s)")
+        if fit.measured:
+            best_metrics = fit.metrics
+            best_score = fit.score
+            success(f"Baseline established: {metric_name}={fit.score:.4f} "
+                    f"[{fit.detail}] ({result.duration_seconds:.1f}s)")
             logger.record_trial(
                 trial=0, commit=git.head_commit(), status="BASELINE",
-                action="BASELINE", metrics=metrics, evaluation=None,
-                runtime_seconds=result.duration_seconds,
+                action="BASELINE", metrics=fit.metrics, evaluation=None,
+                runtime_seconds=result.duration_seconds, score=fit.score,
             )
             kg.record_trial(
                 trial=0, outcome="BASELINE", action="BASELINE",
-                val_loss=metrics.get("val_loss"), commit=git.head_commit(),
+                val_loss=fit.score, commit=git.head_commit(),
             )
-            if goal_target is not None and metrics["val_loss"] < goal_target:
+            if fitness.goal_met(fit.score, goal_target):
                 success("Baseline already satisfies the goal — nothing to do.")
                 logger.finish_session("GOAL_REACHED_AT_BASELINE", 0)
                 report = logger.write_report(workdir / "experiment_report.md")
@@ -493,12 +630,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             diag = Harness.build_diagnostic_prompt(result)
             pending_diagnostic = diag
-            warn(f"Baseline run failed "
-                 f"(error class: {result.error_type}); the Editor will be "
-                 "asked to repair it in trial 1.")
+            warn(f"Baseline run produced no measurable objective "
+                 f"(error class: {result.error_type or 'none'}); the Editor "
+                 "will be asked to repair it in trial 1.")
             logger.record_trial(
                 trial=0, commit=git.head_commit(), status="CRASHED",
-                action="BASELINE", metrics=metrics, evaluation=None,
+                action="BASELINE", metrics=fit.metrics, evaluation=None,
                 error_type=result.error_type,
                 runtime_seconds=result.duration_seconds,
             )
@@ -543,6 +680,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 diagnostic=pending_diagnostic,
                 history_summary=logger.history_summary(),
                 knowledge_context=knowledge_context(),
+                mode=args.preset,
+                eval_command=eval_command_display,
             )
             info(f"Editor summary: {editor_summary[:400]}")
         except AgentError as exc:
@@ -590,33 +729,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         graph_state["current"] = new_graph
         new_graph.save(code_graph_path)
 
-        # -- 2. Sandboxed training run ---------------------------------------
-        info(f"Runner: executing '{args.python} {args.train_script}' "
+        # -- 2. Sandboxed evaluation run ---------------------------------------
+        info(f"Runner: executing '{eval_command_display}' "
              f"(timeout {args.timeout:.0f}s)...")
-        result, metrics = run_training(
-            harness, args.python, args.train_script, metrics_path,
-            args.timeout,
+        result, fit = run_evaluation(
+            harness, eval_command, metrics_path, args.timeout, fitness,
         )
-        crashed = result.crashed or metrics is None or \
-            metrics.get("val_loss") is None
-        crash_diagnostic = Harness.build_diagnostic_prompt(result) \
-            if result.crashed else ""
-        if result.crashed:
-            error(f"Run failed after {result.duration_seconds:.1f}s "
-                  f"(error class: {result.error_type}).")
-        elif metrics is None or metrics.get("val_loss") is None:
-            crash_diagnostic = (
-                "## Metrics contract violation\nThe process exited 0 but "
-                f"produced no usable '{args.metrics_file}' with a numeric "
-                "'val_loss'. The training script must write "
-                '{"epoch": N, "train_loss": X, "val_loss": Y, '
-                '"status": "COMPLETED"} to that file.'
-            )
-            warn("Training exited cleanly but the metrics contract was "
-                 "violated.")
+        metrics = fit.metrics
+        crashed = not fit.measured
+        crash_diagnostic = ""
+        if crashed:
+            if result.crashed:
+                crash_diagnostic = Harness.build_diagnostic_prompt(result)
+                error(f"Run failed after {result.duration_seconds:.1f}s "
+                      f"(error class: {result.error_type}).")
+            else:
+                crash_diagnostic = (
+                    "## Objective contract violation\nThe process exited 0 "
+                    "but produced no measurable objective: no "
+                    f"'{args.metrics_file}' with a numeric score/val_loss, "
+                    "and no recognizable test-runner summary in the output."
+                )
+                warn("Run exited cleanly but produced no measurable "
+                     "objective.")
         else:
+            note = "" if result.succeeded else \
+                " (non-zero exit treated as a measurement, not a crash)"
             success(f"Run completed in {result.duration_seconds:.1f}s: "
-                    f"val_loss={metrics['val_loss']:.4f}")
+                    f"{metric_name}={fit.score:.4f} [{fit.detail}]{note}")
 
         # -- 3. Evaluator verdict ---------------------------------------------
         info("Evaluator (Antigravity): analyzing metrics and dynamics...")
@@ -634,6 +774,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             error_type=result.error_type,
             change_summary=change_text,
             knowledge_context=kg.render_context(),
+            mode=args.preset,
+            eval_command_display=eval_command_display,
+            score=fit.score,
+            best_score=best_score,
+            direction=direction,
+            goal_op=preset["goal_op"],
         )
         info(f"Verdict: {evaluation.status} (via {evaluation.source})")
         info(f"Reasoning: {evaluation.reasoning[:300]}")
@@ -641,8 +787,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         # -- 4. Git state decision ---------------------------------------------
         if evaluation.status == STATUS_GOAL_REACHED:
             commit = git.commit_trial(
-                trial, (metrics or {}).get("val_loss"),
+                trial, fit.score,
                 note=f"GOAL REACHED — {args.goal}",
+                metric_name=metric_name,
             )
             success(f"GOAL REACHED — committed {git.short(commit)}.")
             logger.record_trial(
@@ -650,11 +797,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 action="GOAL_COMMIT", metrics=metrics,
                 evaluation=evaluation.to_dict(),
                 editor_summary=editor_summary,
-                runtime_seconds=result.duration_seconds,
+                runtime_seconds=result.duration_seconds, score=fit.score,
             )
             kg.record_trial(
                 trial=trial, outcome=evaluation.status, action="GOAL_COMMIT",
-                val_loss=(metrics or {}).get("val_loss"), commit=commit,
+                val_loss=fit.score, commit=commit,
                 const_changes=const_changes, func_changes=func_changes,
                 editor_summary=editor_summary,
                 evaluator_reasoning=evaluation.reasoning,
@@ -663,22 +810,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             break
 
         if evaluation.status == STATUS_IMPROVED and not crashed:
-            commit = git.commit_trial(trial, metrics.get("val_loss"))
+            commit = git.commit_trial(trial, fit.score,
+                                      metric_name=metric_name)
             best_metrics = metrics
+            best_score = fit.score
             best_commit = commit
             success(f"Improvement committed as {git.short(commit)} "
                     f"(experiment(trial-{trial}): "
-                    f"val_loss={metrics['val_loss']:.4f}).")
+                    f"{metric_name}={fit.score:.4f}).")
             logger.record_trial(
                 trial=trial, commit=commit, status=evaluation.status,
                 action="COMMITTED", metrics=metrics,
                 evaluation=evaluation.to_dict(),
                 editor_summary=editor_summary,
-                runtime_seconds=result.duration_seconds,
+                runtime_seconds=result.duration_seconds, score=fit.score,
             )
             kg.record_trial(
                 trial=trial, outcome=evaluation.status, action="COMMITTED",
-                val_loss=metrics.get("val_loss"), commit=commit,
+                val_loss=fit.score, commit=commit,
                 const_changes=const_changes, func_changes=func_changes,
                 editor_summary=editor_summary,
                 evaluator_reasoning=evaluation.reasoning,
@@ -704,7 +853,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             evaluation=evaluation.to_dict(),
             editor_summary=editor_summary,
             error_type=result.error_type,
-            runtime_seconds=result.duration_seconds,
+            runtime_seconds=result.duration_seconds, score=fit.score,
         )
         # The failed change is reverted on disk, but it lives on in the
         # knowledge graph as a dead-end fact so no future session (even a
@@ -712,7 +861,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         kg.record_trial(
             trial=trial,
             outcome=STATUS_CRASHED if crashed else evaluation.status,
-            action="REVERTED", val_loss=(metrics or {}).get("val_loss"),
+            action="REVERTED", val_loss=fit.score,
             commit=None, const_changes=const_changes,
             func_changes=func_changes, editor_summary=editor_summary,
             evaluator_reasoning=evaluation.reasoning,
@@ -739,8 +888,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.finish_session(final_result, best["trial"] if best else None)
     print_trial_table(logger.trials)
     if best:
+        best_obj = best.get("score") if best.get("score") is not None \
+            else best.get("val_loss")
         success(f"Best result: trial {best['trial']} with "
-                f"val_loss={best['val_loss']:.4f} "
+                f"{metric_name}={best_obj:.4f} "
                 f"(commit {(best.get('commit') or 'n/a')[:8]}).")
     else:
         warn("No successful trial produced usable metrics.")

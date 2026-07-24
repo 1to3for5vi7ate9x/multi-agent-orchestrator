@@ -1,6 +1,14 @@
 # ml-agent-orchestrator
 
-A closed-loop, CLI-driven automated ML experiment engine.
+A closed-loop, CLI-driven engine for **objective-driven agentic work** —
+ML experimentation and general ("vibe") coding alike. Two presets share
+one loop:
+
+- `--preset ml` (default): minimize `val_loss`/`score` from
+  `metrics.json` produced by your training script.
+- `--preset coding`: minimize failing tests from any
+  `--eval-command` (`pytest -q`, `npm test`, ...) — goal reached when
+  the suite is green.
 
 - **Claude Code** acts as the **Model & Experiment Editor** — it edits your
   `model.py` / `train.py` (architecture, training loop, hyperparameters,
@@ -92,28 +100,69 @@ Optional extra keys the evaluator will use if present: `history` (per-epoch
 loss curve) and `gpu_mem_mb`. Write it every epoch (like the template does)
 so partial progress survives timeouts.
 
-## Quick start (self-contained demo)
+## Install
 
 ```bash
-# 1. Create an experiment workspace from the templates
-mkdir -p ~/experiments/demo
-cp templates/train_example.py ~/experiments/demo/train.py
-cp templates/model_example.py ~/experiments/demo/model_example.py
+# One-shot, no clone (after first PyPI release):
+uvx ml-agent-orchestrator --help          # runs the ml-orchestrator CLI
 
-# 2. Run the closed loop (--init-git creates the repo + baseline commit)
+# Or straight from GitHub today:
+uvx --from git+https://github.com/1to3for5vi7ate9x/multi-agent-orchestrator \
+    ml-orchestrator --help
+
+# Or as a developer:
+git clone git@github.com:1to3for5vi7ate9x/multi-agent-orchestrator.git
+cd multi-agent-orchestrator
+uv sync --dev
+uv run python tests/run_all.py            # all suites should pass
+```
+
+## Quick start (self-contained ML demo)
+
+```bash
+# --scaffold-demo drops a working train.py/model_example.py in the
+# workspace; --init-git creates the repo + baseline commit.
 uv run ml-orchestrator \
   --goal "Achieve validation loss < 0.05 on the synthetic dataset without overfitting" \
   --workdir ~/experiments/demo \
-  --train-script train.py \
+  --scaffold-demo \
   --max-trials 5 \
   --timeout 300 \
   --init-git
 ```
 
-`uv run ml-orchestrator` is the installed console entry point;
-`uv run main.py` works identically. The training subprocess uses the
-uv-managed interpreter by default (override with `--python` to point at
-a different env, e.g. a CUDA conda env).
+The evaluation subprocess uses the uv-managed interpreter by default
+(override with `--python` to point at e.g. a CUDA conda env).
+
+## Vibe coding / general development
+
+```bash
+cd your-app        # git repo with a test suite (or pass --init-git)
+uv run ml-orchestrator \
+  --preset coding \
+  --goal "Implement the pagination feature and make the whole test suite pass" \
+  --eval-command "pytest -q" \
+  --editable-files api/pagination.py api/views.py \
+  --max-trials 10
+```
+
+How the coding preset differs:
+
+- **Fitness = failing tests.** The score is parsed from pytest / jest /
+  vitest / go-test output (a test command exiting 1 because tests fail
+  is a *measurement*, not a crash). Goal condition: `failing_tests <= 0`.
+- `--eval-command` is auto-detected when omitted (pytest config or
+  `tests/` → `pytest -q`; `package.json` → `npm test`).
+- The Editor is instructed to fix the code, **never the tests**, and
+  commits land as `experiment(trial-3): failing_tests=2.0000`.
+- No `metrics.json` needed — but if your eval command writes one with a
+  `score` field, it takes precedence (custom fitness functions:
+  benchmark latency, lighthouse score, anything numeric; combine with
+  `--direction maximize` and `--goal-target`).
+
+Everything else — git commit/revert rails, persistent sessions,
+context rotation, code graph, knowledge graph — works identically in
+both presets.
 
 ## Using it on your own project
 
@@ -132,7 +181,12 @@ uv run --project /path/to/ml_orchestrator ml-orchestrator \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--goal` | *(required)* | Natural-language target objective. A numeric target (e.g. "val loss < 0.25") is also parsed for the fallback evaluator. |
+| `--goal` | *(required)* | Natural-language target objective. A numeric target (e.g. "val loss < 0.25", "score >= 0.9") is also parsed for the fallback evaluator. |
+| `--preset` | `ml` | Objective preset: `ml` (minimize val_loss from metrics.json) or `coding` (minimize failing tests). |
+| `--eval-command` | preset-dependent | Shell command measuring the objective each trial (`pytest -q`, `npm test`, `python train.py`...). |
+| `--direction` | from preset | `minimize` or `maximize` the score. |
+| `--goal-target` | parsed from goal | Explicit numeric goal for the score. |
+| `--scaffold-demo` | off | Drop the bundled demo train.py/model into the workspace first. |
 | `--max-trials` | `5` | Maximum edit→train→evaluate iterations. |
 | `--train-script` | `train.py` | Script executed each trial via `--python`. |
 | `--timeout` | `900` | Per-run training limit (seconds); the whole process tree is killed on expiry. |
@@ -307,22 +361,40 @@ pollute the experiment diffs.
 ## Project layout
 
 ```
-ml_orchestrator/
-├── pyproject.toml         # uv project: deps, entry point, build config
-├── uv.lock                # locked dependency graph (commit this)
-├── .python-version        # interpreter pin used by uv
-├── main.py                # CLI entrypoint + closed-loop state machine
-├── core/
-│   ├── agents.py          # Claude/Antigravity CLI bridges, schema parser, fallback evaluator
-│   ├── runner.py          # Sandboxed subprocess harness, timeout, error triage
-│   ├── git_manager.py     # Commit/revert/rollback + .gitignore management
-│   ├── session.py         # Persistent sessions, context ledger, memory rotation
-│   ├── code_graph.py      # AST code map: constants, call edges, trial diffs
-│   ├── knowledge_graph.py # Temporal experiment facts: wins, dead ends, techniques
-│   └── logger.py          # experiments_history.json + markdown report
-├── templates/
-│   ├── train_example.py   # PyTorch (NumPy/stdlib-fallback) demo trainer → metrics.json
-│   └── model_example.py   # Baseline MLP with tunable hyperparameters
-├── requirements.txt       # legacy pip fallback only
+multi-agent-orchestrator/
+├── pyproject.toml             # uv project: deps, entry point, build config
+├── uv.lock                    # locked dependency graph (committed)
+├── .python-version            # interpreter pin used by uv
+├── .github/workflows/
+│   ├── ci.yml                 # tests + build on every push/PR
+│   └── release.yml            # tag v* → PyPI (trusted publishing) + GitHub Release
+├── src/ml_orchestrator/
+│   ├── main.py                # CLI entrypoint + closed-loop state machine
+│   ├── core/
+│   │   ├── agents.py          # Claude/Antigravity CLI bridges, schema parser, fallback evaluator
+│   │   ├── runner.py          # Sandboxed subprocess harness, timeout, error triage
+│   │   ├── fitness.py         # Generalized objective: metrics file / test parsing / exit code
+│   │   ├── git_manager.py     # Commit/revert/rollback + .gitignore management
+│   │   ├── session.py         # Persistent sessions, context ledger, memory rotation
+│   │   ├── code_graph.py      # AST code map: constants, call edges, trial diffs
+│   │   ├── knowledge_graph.py # Temporal experiment facts: wins, dead ends, techniques
+│   │   └── logger.py          # experiments_history.json + markdown report
+│   └── templates/             # bundled demo (used by --scaffold-demo)
+├── tests/                     # runnable suites: uv run python tests/run_all.py
+├── requirements.txt           # legacy pip fallback only
 └── README.md
 ```
+
+## Releasing (maintainers)
+
+Tag and push — CI does the rest:
+
+```bash
+git tag v0.4.0 && git push origin v0.4.0
+```
+
+`release.yml` runs the tests, builds sdist+wheel with `uv build`,
+publishes to PyPI via OIDC **trusted publishing** (one-time setup: add
+this repo as a Trusted Publisher on pypi.org with environment `pypi`,
+and create that environment in the GitHub repo settings — no API tokens
+ever), and attaches the artifacts to a GitHub Release.

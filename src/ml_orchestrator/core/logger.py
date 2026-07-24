@@ -96,9 +96,12 @@ class ExperimentLogger:
         editor_summary: str = "",
         error_type: Optional[str] = None,
         runtime_seconds: Optional[float] = None,
+        score: Optional[float] = None,
     ) -> None:
         if self._session is None:
             raise RuntimeError("record_trial() called before start_session().")
+        if score is None:
+            score = (metrics or {}).get("score", (metrics or {}).get("val_loss"))
         entry = {
             "trial": trial,
             "timestamp": _now(),
@@ -107,6 +110,7 @@ class ExperimentLogger:
             "action": action,  # COMMITTED | REVERTED | GOAL_COMMIT | SKIPPED
             "train_loss": (metrics or {}).get("train_loss"),
             "val_loss": (metrics or {}).get("val_loss"),
+            "score": score,
             "loss_curve": (metrics or {}).get("history"),
             "metrics": metrics,
             "evaluation": evaluation,
@@ -143,20 +147,30 @@ class ExperimentLogger:
         return list(self._session["trials"]) if self._session else []
 
     def best_trial(self) -> Optional[Dict[str, Any]]:
+        def objective(t: Dict[str, Any]) -> Optional[float]:
+            v = t.get("score")
+            return v if v is not None else t.get("val_loss")
+
         candidates = [
             t for t in self.trials
-            if t.get("val_loss") is not None
+            if objective(t) is not None
             and t.get("action") in ("COMMITTED", "GOAL_COMMIT", "BASELINE")
         ]
         if not candidates:
             return None
-        return min(candidates, key=lambda t: t["val_loss"])
+        direction = "minimize"
+        if self._session:
+            direction = (self._session.get("config") or {}).get(
+                "direction", "minimize")
+        chooser = max if direction == "maximize" else min
+        return chooser(candidates, key=objective)
 
     def history_summary(self, max_trials: int = 10) -> str:
         """Compact per-trial digest injected into agent prompts."""
         lines = []
         for t in self.trials[-max_trials:]:
-            val = t.get("val_loss")
+            val = t.get("score") if t.get("score") is not None \
+                else t.get("val_loss")
             val_str = f"{val:.4f}" if isinstance(val, (int, float)) else "n/a"
             note = ""
             ev = t.get("evaluation") or {}
@@ -164,7 +178,7 @@ class ExperimentLogger:
                 note = " | " + ev["reasoning"][:160].replace("\n", " ")
             lines.append(
                 f"- trial {t['trial']}: status={t['status']}, "
-                f"val_loss={val_str}, action={t['action']}{note}"
+                f"score={val_str}, action={t['action']}{note}"
             )
         return "\n".join(lines)
 
@@ -185,24 +199,29 @@ class ExperimentLogger:
             f"- **Result**    : **{s['result']}**",
             f"- **Trials run**: {len(s['trials'])}",
         ]
+        metric_name = (s.get("config") or {}).get("metric_name", "score")
         if best:
+            best_obj = best.get("score") if best.get("score") is not None \
+                else best.get("val_loss")
             lines += [
                 f"- **Best trial**: {best['trial']} "
-                f"(val_loss={best['val_loss']:.4f}, "
+                f"({metric_name}={best_obj:.4f}, "
                 f"commit `{(best.get('commit') or 'n/a')[:8]}`)",
             ]
         lines += [
             "",
             "## Trial log",
             "",
-            "| Trial | Status | val_loss | train_loss | Action | Commit |",
+            f"| Trial | Status | {metric_name} | train_loss | Action | Commit |",
             "|------:|--------|---------:|-----------:|--------|--------|",
         ]
         for t in s["trials"]:
             def fmt(x: Any) -> str:
                 return f"{x:.4f}" if isinstance(x, (int, float)) else "n/a"
+            obj = t.get("score") if t.get("score") is not None \
+                else t.get("val_loss")
             lines.append(
-                f"| {t['trial']} | {t['status']} | {fmt(t.get('val_loss'))} "
+                f"| {t['trial']} | {t['status']} | {fmt(obj)} "
                 f"| {fmt(t.get('train_loss'))} | {t['action']} "
                 f"| `{(t.get('commit') or 'n/a')[:8]}` |"
             )

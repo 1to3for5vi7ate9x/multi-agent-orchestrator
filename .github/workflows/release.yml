@@ -1,0 +1,71 @@
+name: Release
+
+# Publishes to PyPI + creates a GitHub Release whenever a version tag
+# (v0.4.0, v1.2.3, ...) is pushed:
+#
+#   git tag v0.4.0 && git push origin v0.4.0
+#
+# One-time setup required on PyPI (no API tokens needed afterwards):
+#   1. Create the project's first release manually OR reserve the name.
+#   2. On pypi.org -> Manage project -> Publishing -> add a "Trusted
+#      Publisher": repository 1to3for5vi7ate9x/multi-agent-orchestrator,
+#      workflow "release.yml", environment "pypi".
+#   3. In the GitHub repo settings, create an environment named "pypi".
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync and test before releasing
+        run: |
+          uv sync --dev
+          uv run python tests/run_all.py
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # OIDC trusted publishing — no API token needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

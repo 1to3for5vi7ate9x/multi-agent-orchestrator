@@ -18,3 +18,4 @@ experiment_report.md
 .DS_Store
 .idea/
 .vscode/
+dist/

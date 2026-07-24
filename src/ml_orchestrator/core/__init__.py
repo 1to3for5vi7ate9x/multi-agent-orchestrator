@@ -23,6 +23,7 @@ from .agents import (
     STATUS_UNKNOWN,
 )
 from .logger import ExperimentLogger
+from .fitness import FitnessExtractor, FitnessResult, parse_test_results
 from .code_graph import CodeGraph, format_changes
 from .knowledge_graph import ExperimentKnowledgeGraph
 from .session import (
@@ -43,6 +44,9 @@ __all__ = [
     "GeminiEvaluator",
     "EvaluationResult",
     "ExperimentLogger",
+    "FitnessExtractor",
+    "FitnessResult",
+    "parse_test_results",
     "CodeGraph",
     "format_changes",
     "ExperimentKnowledgeGraph",
