@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ml-agent-orchestrator runtime artifacts (generated in experiment workspaces)
+.agent_memory/
+metrics.json
+experiments_history.json
+experiment_report.md
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

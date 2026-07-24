@@ -1,0 +1,11 @@
+# ml-agent-orchestrator core dependencies
+rich>=13.0          # colored terminal UI (optional — plain ANSI fallback built in)
+numpy>=1.24         # required by the example training templates
+
+# Optional — the example templates auto-detect PyTorch and fall back to NumPy:
+# torch>=2.1
+
+# External (non-pip) prerequisites, must be installed and authenticated:
+#   claude  — Claude Code CLI            (https://claude.com/claude-code)
+#   agy     — Google Antigravity CLI     (https://codelabs.developers.google.com/antigravity-cli-hands-on)
+#   git     — any recent version
