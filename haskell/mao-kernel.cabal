@@ -1,0 +1,27 @@
+cabal-version:      2.4
+name:               mao-kernel
+version:            0.5.0
+synopsis:           Judge/referee decision kernel for ml-agent-orchestrator
+description:
+  The trust-critical decision core of the ml-agent-orchestrator loop:
+  blind-tournament score aggregation (judge) and deterministic flow
+  rules (referee), implemented as total pure functions. One JSON
+  request on stdin, one JSON response on stdout, no other IO.
+  The Python orchestrator invokes this binary when present
+  (MAO_KERNEL env var or `mao-kernel` on PATH) and falls back to a
+  behavior-identical Python implementation otherwise; both are held
+  to the same golden vectors in tests/kernel_vectors.json.
+license:            MIT
+build-type:         Simple
+
+executable mao-kernel
+  main-is:          Main.hs
+  hs-source-dirs:   src
+  build-depends:
+    base        >= 4.14 && < 5,
+    aeson       >= 2.0,
+    bytestring,
+    text,
+    containers
+  default-language: Haskell2010
+  ghc-options:      -Wall -Werror

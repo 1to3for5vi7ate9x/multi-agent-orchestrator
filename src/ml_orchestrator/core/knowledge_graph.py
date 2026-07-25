@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 GOOD_OUTCOMES = {"IMPROVED", "GOAL_REACHED", "BASELINE"}
-BAD_OUTCOMES = {"REGRESSED", "CRASHED"}
+BAD_OUTCOMES = {"REGRESSED", "CRASHED", "REFEREE_BLOCKED"}
 
 # Heuristic technique taxonomy extracted from editor change summaries.
 TECHNIQUE_PATTERNS: List[Tuple[str, str]] = [

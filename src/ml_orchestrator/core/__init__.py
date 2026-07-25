@@ -24,6 +24,9 @@ from .agents import (
 )
 from .logger import ExperimentLogger
 from .fitness import FitnessExtractor, FitnessResult, parse_test_results
+from .roster import AgentSpec, AskAgent, default_roster, resolve_roster
+from .tournament import TournamentResult, run_tournament
+from .referee import Flag, Referee
 from .code_graph import CodeGraph, format_changes
 from .knowledge_graph import ExperimentKnowledgeGraph
 from .session import (
@@ -47,6 +50,14 @@ __all__ = [
     "FitnessExtractor",
     "FitnessResult",
     "parse_test_results",
+    "AgentSpec",
+    "AskAgent",
+    "default_roster",
+    "resolve_roster",
+    "TournamentResult",
+    "run_tournament",
+    "Flag",
+    "Referee",
     "CodeGraph",
     "format_changes",
     "ExperimentKnowledgeGraph",

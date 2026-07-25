@@ -19,8 +19,10 @@ for custom flags or model selection.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -71,6 +73,7 @@ class _CLIAgent:
         cwd: Optional[Path] = None,
         timeout: float = 600.0,
         session: Optional[Any] = None,
+        last_message_flag: Optional[str] = None,
     ) -> None:
         self.base_command = list(base_command)
         self.cwd = Path(cwd).resolve() if cwd else Path.cwd()
@@ -79,6 +82,9 @@ class _CLIAgent:
         # a persistent, resumable conversation with context tracking and
         # automatic memory handoff instead of stateless one-shot processes.
         self.session = session
+        # CLIs whose stdout mixes event noise with the answer (codex)
+        # write the final message to a temp file via this flag instead.
+        self.last_message_flag = last_message_flag
 
     def _invoke(self, prompt: str) -> str:
         if self.session is not None:
@@ -86,7 +92,13 @@ class _CLIAgent:
         return self._invoke_stateless(prompt)
 
     def _invoke_stateless(self, prompt: str) -> str:
-        command = self.base_command + [prompt]
+        capture_path: Optional[str] = None
+        command = list(self.base_command)
+        if self.last_message_flag:
+            fd, capture_path = tempfile.mkstemp(suffix=".lastmsg.txt")
+            os.close(fd)
+            command += [self.last_message_flag, capture_path]
+        command.append(prompt)
         try:
             proc = subprocess.run(
                 command,
@@ -105,13 +117,22 @@ class _CLIAgent:
                 f"Agent CLI {self.base_command[0]!r} timed out after "
                 f"{self.timeout:.0f}s."
             ) from exc
+        finally:
+            captured = ""
+            if capture_path:
+                try:
+                    captured = Path(capture_path).read_text(
+                        encoding="utf-8").strip()
+                    Path(capture_path).unlink(missing_ok=True)
+                except OSError:
+                    captured = ""
 
         if proc.returncode != 0:
             raise AgentError(
                 f"Agent CLI {self.base_command[0]!r} exited with code "
                 f"{proc.returncode}:\n{(proc.stderr or proc.stdout).strip()[:2000]}"
             )
-        return proc.stdout.strip()
+        return captured or proc.stdout.strip()
 
 
 # --------------------------------------------------------------------------
@@ -129,9 +150,11 @@ class ClaudeEditor(_CLIAgent):
         command: Optional[Sequence[str]] = None,
         timeout: float = 900.0,
         session: Optional[Any] = None,
+        last_message_flag: Optional[str] = None,
     ) -> None:
         super().__init__(command or self.DEFAULT_COMMAND, cwd=cwd,
-                         timeout=timeout, session=session)
+                         timeout=timeout, session=session,
+                         last_message_flag=last_message_flag)
 
     def build_prompt(
         self,
@@ -245,9 +268,11 @@ class AntigravityEvaluator(_CLIAgent):
         command: Optional[Sequence[str]] = None,
         timeout: float = 300.0,
         session: Optional[Any] = None,
+        last_message_flag: Optional[str] = None,
     ) -> None:
         super().__init__(command or self.DEFAULT_COMMAND, cwd=cwd,
-                         timeout=timeout, session=session)
+                         timeout=timeout, session=session,
+                         last_message_flag=last_message_flag)
 
     def build_prompt(
         self,

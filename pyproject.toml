@@ -1,7 +1,7 @@
 [project]
 name = "ml-agent-orchestrator"
-version = "0.4.1"
-description = "Closed-loop automated ML experiment engine driven by Claude Code (editor) and Google Antigravity CLI (evaluator), with git-based state decisions, persistent agent sessions, context-rotation memory, an AST code graph and a temporal experiment knowledge graph."
+version = "0.5.0"
+description = "Closed-loop, self-improving agent engine: Claude Code, Google Antigravity and OpenAI Codex compete for the Editor seat via blind-tournament judging, a deterministic referee (Haskell decision kernel + verified Python fallback) polices the flow, and git + an objective fitness signal arbitrate every change. Persistent sessions, context-rotation memory, AST code graph, temporal experiment knowledge graph."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

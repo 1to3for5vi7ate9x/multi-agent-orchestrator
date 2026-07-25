@@ -97,6 +97,9 @@ class ExperimentLogger:
         error_type: Optional[str] = None,
         runtime_seconds: Optional[float] = None,
         score: Optional[float] = None,
+        referee_flags: Optional[List[Dict[str, str]]] = None,
+        editor_agent: Optional[str] = None,
+        evaluator_agent: Optional[str] = None,
     ) -> None:
         if self._session is None:
             raise RuntimeError("record_trial() called before start_session().")
@@ -117,6 +120,9 @@ class ExperimentLogger:
             "editor_summary": editor_summary,
             "error_type": error_type,
             "runtime_seconds": runtime_seconds,
+            "referee_flags": referee_flags or [],
+            "editor_agent": editor_agent,
+            "evaluator_agent": evaluator_agent,
         }
         self._session["trials"].append(entry)
         self._save()

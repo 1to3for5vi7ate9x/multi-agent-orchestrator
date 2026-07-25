@@ -1,8 +1,16 @@
 # ml-agent-orchestrator
 
 A closed-loop, CLI-driven engine for **objective-driven agentic work** —
-ML experimentation and general ("vibe") coding alike. Two presets share
-one loop:
+ML experimentation and general ("vibe") coding alike — where **three
+agents (Claude Code, Google Antigravity, OpenAI Codex) compete for the
+working seats**: a blind judge panel rates anonymous proposals and the
+winner drives, a deterministic referee polices the flow (test
+tampering, fabricated verdicts, repeated dead ends), and git + an
+objective fitness signal remain the final arbiter of every change.
+See [`docs/judge-referee.md`](docs/judge-referee.md) for the full
+harness design (including the Haskell decision kernel).
+
+Two presets share one loop:
 
 - `--preset ml` (default): minimize `val_loss`/`score` from
   `metrics.json` produced by your training script.
@@ -81,7 +89,14 @@ Every trial is recorded in `experiments_history.json`; a markdown
    > the orchestrator still runs using a built-in numeric fallback
    > evaluator (compares `val_loss` against the best so far) — you lose
    > the scientific reasoning, not the loop.
-4. Optional: PyTorch for the example templates (they fall back to
+4. Optional but recommended: **OpenAI Codex CLI** (`codex`), the third
+   competitor for the tournament (`npm install -g @openai/codex`, then
+   run `codex` once to log in). Any missing agent is simply dropped
+   from the roster.
+5. Optional: the compiled **Haskell decision kernel** (`mao-kernel`) —
+   see [`docs/judge-referee.md`](docs/judge-referee.md); without it a
+   verified Python fallback is used.
+6. Optional: PyTorch for the example templates (they fall back to
    NumPy, then pure-stdlib, automatically):
    ```bash
    uv sync --extra torch
@@ -200,6 +215,9 @@ uv run --project /path/to/ml_orchestrator ml-orchestrator \
 | `--evaluator-cmd` | `agy -p` | Override the Evaluator command template (`--gemini-cmd` is kept as a deprecated alias). |
 | `--agent-timeout` | `900` | Time limit per agent CLI call (seconds). |
 | `--no-echo` | off | Don't stream training logs live to the terminal. |
+| `--agents` | all installed | Competing agent pool: any of `claude` `antigravity` `codex`. |
+| `--no-rotate` | off | Disable blind-tournament seat rotation (static v0.4 seats). |
+| `--tournament-every` | `0` | Extra fixed-cadence tournaments every N trials (0 = start + stagnation only). |
 | `--stateless` | off | Disable persistent sessions — every agent call becomes a fresh, memoryless process (pre-v2 behavior). |
 | `--context-limit` | `1000000` | Model context window in tokens (Claude Code 1M-context model). |
 | `--rotate-at` | `0.5` | Fraction of the context limit at which a session is closed & reborn with a memory snapshot. |
@@ -263,6 +281,32 @@ Memory directory layout:
 
 The directory is gitignored *before* the pre-experiment snapshot commit,
 so memory artifacts never pollute experiment diffs.
+
+## The judge, the referee, and the Haskell kernel (v0.5)
+
+- **Blind tournament (judge).** Each roster agent writes an anonymous
+  proposal for the next change; identities are scrubbed and labels
+  shuffled; every agent then scores all candidates 1-10 against a fixed
+  rubric. Highest mean takes the **Editor** seat and implements its own
+  proposal; the runner-up takes the **Evaluator** seat. Re-runs at
+  start, after 2 commit-less trials, and optionally every N trials.
+  The judge decides *who drives* — commits/reverts are still decided
+  only by the objective fitness signal.
+- **Referee (deterministic watchdog).** Pure rules, not an LLM:
+  modifying test files in coding mode is CRITICAL and force-reverted
+  before any run is wasted; verdicts that contradict the numbers are
+  downgraded (numeric truth wins); metrics-file fabrication, repeated
+  dead ends and suspicious jumps are flagged into the history, the
+  editor's feedback, and the next tournament's judging context.
+- **Haskell decision kernel (`haskell/`).** The judge aggregation and
+  referee rules — the trust-critical decision core — are canonically
+  implemented as a pure Haskell binary (`mao-kernel`, JSON in/out).
+  The orchestrator uses it when found (`$MAO_KERNEL` or PATH) and
+  falls back to a behavior-identical Python implementation otherwise;
+  both are pinned to the same golden vectors
+  (`tests/kernel_vectors.json`), so `uvx ml-agent-orchestrator` still
+  works with zero extra toolchain. Build instructions:
+  [`docs/judge-referee.md`](docs/judge-referee.md).
 
 ## Built-in knowledge graphs (v0.3)
 
@@ -371,7 +415,11 @@ multi-agent-orchestrator/
 ├── src/ml_orchestrator/
 │   ├── main.py                # CLI entrypoint + closed-loop state machine
 │   ├── core/
-│   │   ├── agents.py          # Claude/Antigravity CLI bridges, schema parser, fallback evaluator
+│   │   ├── agents.py          # Role prompts + CLI invocation, schema parser, fallback evaluator
+│   │   ├── roster.py          # Agent pool: claude / antigravity / codex specs + AskAgent
+│   │   ├── tournament.py      # Blind proposals, anonymization, panel judging, seats
+│   │   ├── referee.py         # Deterministic watchdog rules (Python fallback of the kernel)
+│   │   ├── kernel.py          # Bridge to the Haskell decision kernel (fail-open)
 │   │   ├── runner.py          # Sandboxed subprocess harness, timeout, error triage
 │   │   ├── fitness.py         # Generalized objective: metrics file / test parsing / exit code
 │   │   ├── git_manager.py     # Commit/revert/rollback + .gitignore management
@@ -380,6 +428,8 @@ multi-agent-orchestrator/
 │   │   ├── knowledge_graph.py # Temporal experiment facts: wins, dead ends, techniques
 │   │   └── logger.py          # experiments_history.json + markdown report
 │   └── templates/             # bundled demo (used by --scaffold-demo)
+├── haskell/                   # mao-kernel: canonical judge/referee decision kernel
+├── docs/judge-referee.md      # harness design: tournament, referee, kernel protocol
 ├── tests/                     # runnable suites: uv run python tests/run_all.py
 ├── requirements.txt           # legacy pip fallback only
 └── README.md

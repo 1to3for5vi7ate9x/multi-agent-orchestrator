@@ -38,3 +38,32 @@ jobs:
         run: |
           uv run ml-orchestrator --help
           uv run python -m ml_orchestrator --help
+
+  kernel:
+    # Build the canonical Haskell decision kernel and prove parity with
+    # the Python fallback on the shared golden vectors.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.6"
+          cabal-version: "3.10"
+
+      - name: Build mao-kernel
+        working-directory: haskell
+        run: |
+          cabal update
+          cabal build exe:mao-kernel
+          echo "MAO_KERNEL=$(cabal list-bin mao-kernel)" >> "$GITHUB_ENV"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Kernel parity vectors
+        run: |
+          uv sync --dev
+          uv run python tests/test_judge_referee.py

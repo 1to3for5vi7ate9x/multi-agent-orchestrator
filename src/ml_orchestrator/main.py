@@ -15,10 +15,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import sys
+from collections import Counter
 from importlib import resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,7 +41,9 @@ from .core import (
     STATUS_REGRESSED,
 )
 from .core import CodeGraph, ExperimentKnowledgeGraph, format_changes
+from .core import AskAgent, Referee, resolve_roster, run_tournament
 from .core.agents import heuristic_evaluation, parse_goal_target
+from .core.referee import CRITICAL as FLAG_CRITICAL
 from .core.git_manager import DEFAULT_IGNORES
 from .core.runner import ExecutionHarness as Harness  # alias for clarity
 from .core.session import (
@@ -238,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-dir", default=".agent_memory",
                    help="Directory (inside --workdir) holding memory "
                         "snapshots, archives, and live session state.")
+    p.add_argument("--agents", nargs="*", default=None,
+                   help="Agent pool for seat rotation (subset of: claude "
+                        "antigravity codex). Default: every installed one.")
+    p.add_argument("--no-rotate", action="store_true",
+                   help="Disable blind-tournament seat rotation; pin the "
+                        "v0.4 static seats (claude edits, antigravity "
+                        "evaluates).")
+    p.add_argument("--tournament-every", type=int, default=0,
+                   help="Re-run the blind tournament every N trials "
+                        "(0 = only at start and after 2 consecutive "
+                        "non-improving trials).")
     return p
 
 
@@ -357,8 +372,9 @@ def evaluate_run(
     best_score: Optional[float] = None,
     direction: str = "minimize",
     goal_op: str = "<",
+    evaluator_name: str = "",
 ):
-    """Antigravity verdict with a numeric-heuristic safety net."""
+    """Evaluator-seat verdict with a numeric-heuristic safety net."""
     if evaluator is not None:
         try:
             evaluation = evaluator.evaluate(
@@ -381,6 +397,8 @@ def evaluate_run(
                 warn("Evaluator claimed success on a crashed run; "
                      "overriding to CRASHED.")
                 evaluation.status = STATUS_CRASHED
+            if evaluator_name:
+                evaluation.source = evaluator_name
             return evaluation
         except AgentError as exc:
             warn(f"Antigravity evaluation failed ({exc}); "
@@ -471,26 +489,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     info(f"Editable files: {', '.join(editable)}")
 
-    claude_available = shutil.which(
-        (args.claude_cmd or "claude").split()[0]
-    ) is not None
-    evaluator_available = shutil.which(
-        (args.evaluator_cmd or "agy").split()[0]
-    ) is not None
-    if not claude_available:
-        error("Claude CLI not found on PATH — the Editor agent is required. "
-              "Install Claude Code and run 'claude' once to log in.")
+    # ---- Agent roster (claude / antigravity / codex) ----------------------
+    try:
+        roster = resolve_roster(args.agents)
+    except ValueError as exc:
+        error(str(exc))
         return 2
-    if not evaluator_available:
-        warn("Antigravity CLI ('agy') not found on PATH — falling back to "
-             "the built-in numeric evaluator (no scientific reasoning). "
-             "Install it and log in, or point --evaluator-cmd at your "
-             "binary.")
+    if args.claude_cmd and "claude" in roster:
+        roster["claude"].edit_cmd = args.claude_cmd.split()
+    if args.evaluator_cmd and "antigravity" in roster:
+        roster["antigravity"].ask_cmd = args.evaluator_cmd.split()
+    if not roster:
+        error("No agent CLIs found on PATH. Install at least one of: "
+              "claude (Claude Code), agy (Antigravity), codex (Codex CLI) "
+              "and log in.")
+        return 2
+    info(f"Agent roster: {', '.join(roster)}")
+    rotate = (not args.no_rotate) and len(roster) >= 2
+    if rotate:
+        info("Seat rotation ON — blind tournament (anonymous proposals, "
+             "panel judging) assigns the Editor/Evaluator seats; the "
+             "referee watches the flow.")
+    else:
+        info("Seat rotation OFF — static seats.")
 
-    claude_base = args.claude_cmd.split() if args.claude_cmd \
-        else list(ClaudeEditor.DEFAULT_COMMAND)
-    evaluator_base = args.evaluator_cmd.split() if args.evaluator_cmd \
-        else list(AntigravityEvaluator.DEFAULT_COMMAND)
+    ref = Referee(mode=args.preset, metrics_filename=args.metrics_file,
+                  direction=direction)
+    recent_flags: List[Dict[str, str]] = []
 
     # ---- Knowledge layer: code graph + temporal experiment graph -----------
     memory_dir = workdir / args.memory_dir
@@ -514,53 +539,86 @@ def main(argv: Optional[List[str]] = None) -> int:
         parts.append(graph_state["current"].render_map())
         return "\n\n".join(p for p in parts if p.strip())
 
-    editor_session = evaluator_session = None
+    memory: Optional[MemoryStore] = None
     if not args.stateless:
         memory = MemoryStore(memory_dir)
         memory.context_provider = knowledge_context
-        editor_session = ManagedSession(
-            agent_name="editor",
-            role_description="the Model & Experiment Editor",
-            adapter=ClaudeSessionAdapter(claude_base),
-            memory=memory,
-            cwd=workdir,
-            context_limit=args.context_limit,
-            rotate_at=args.rotate_at,
-            timeout=args.agent_timeout,
-        )
-        if evaluator_available:
-            evaluator_session = ManagedSession(
-                agent_name="evaluator",
-                role_description="the Research & Evaluation Specialist",
-                adapter=AntigravitySessionAdapter(evaluator_base),
+        info("Persistent agent sessions ON — conversations resume across "
+             f"trials; rotation at {args.rotate_at:.0%} of "
+             f"{args.context_limit:,} tokens with memory handoff.")
+    else:
+        info("Persistent agent sessions OFF (--stateless): agents forget "
+             "everything between calls.")
+
+    # Seat state + lazily-built per-agent instances. Editors get
+    # persistent sessions where the CLI supports resume (claude, agy);
+    # codex runs stateless and relies on the injected knowledge context.
+    live_sessions: Dict[str, ManagedSession] = {}
+    editor_cache: Dict[str, ClaudeEditor] = {}
+    evaluator_cache: Dict[str, AntigravityEvaluator] = {}
+    ask_cache: Dict[str, AskAgent] = {}
+
+    def _session_for(role: str, name: str, base_cmd: List[str]):
+        spec = roster[name]
+        if memory is None or spec.session_adapter is None:
+            return None
+        key = f"{role}-{name}"
+        if key not in live_sessions:
+            live_sessions[key] = ManagedSession(
+                agent_name=key,
+                role_description=(
+                    "the Code & Experiment Editor" if role == "editor"
+                    else "the Research & Evaluation Specialist"),
+                adapter=spec.session_adapter(base_cmd),
                 memory=memory,
                 cwd=workdir,
                 context_limit=args.context_limit,
                 rotate_at=args.rotate_at,
                 timeout=args.agent_timeout,
             )
-        info("Persistent agent sessions ON — conversations resume across "
-             f"trials; rotation at {args.rotate_at:.0%} of "
-             f"{args.context_limit:,} tokens with memory handoff.")
-        if editor_session.session_id:
-            info(f"Resuming previous editor session "
-                 f"({editor_session.status_line()}).")
-    else:
-        info("Persistent agent sessions OFF (--stateless): agents forget "
-             "everything between calls.")
+        return live_sessions[key]
 
-    editor = ClaudeEditor(
-        cwd=workdir,
-        command=claude_base,
-        timeout=args.agent_timeout,
-        session=editor_session,
-    )
-    evaluator = AntigravityEvaluator(
-        cwd=workdir,
-        command=evaluator_base,
-        timeout=args.agent_timeout,
-        session=evaluator_session,
-    ) if evaluator_available else None
+    def editor_for(name: str) -> ClaudeEditor:
+        if name not in editor_cache:
+            spec = roster[name]
+            editor_cache[name] = ClaudeEditor(
+                cwd=workdir,
+                command=spec.edit_cmd,
+                timeout=args.agent_timeout,
+                session=_session_for("editor", name, spec.edit_cmd),
+                last_message_flag=spec.last_message_flag,
+            )
+        return editor_cache[name]
+
+    def evaluator_for(name: Optional[str]) -> Optional[AntigravityEvaluator]:
+        if name is None:
+            return None
+        if name not in evaluator_cache:
+            spec = roster[name]
+            evaluator_cache[name] = AntigravityEvaluator(
+                cwd=workdir,
+                command=spec.ask_cmd,
+                timeout=args.agent_timeout,
+                session=_session_for("evaluator", name, spec.ask_cmd),
+                last_message_flag=spec.last_message_flag,
+            )
+        return evaluator_cache[name]
+
+    def ask_agents() -> Dict[str, AskAgent]:
+        for name, spec in roster.items():
+            if name not in ask_cache:
+                ask_cache[name] = AskAgent(spec, workdir, args.agent_timeout)
+        return ask_cache
+
+    # Initial seats (tournament reassigns them when rotation is on).
+    seat_editor = "claude" if "claude" in roster else next(iter(roster))
+    _others = [n for n in roster if n != seat_editor]
+    seat_evaluator: Optional[str] = (
+        "antigravity" if "antigravity" in _others
+        else (_others[0] if _others else None))
+    if seat_evaluator is None:
+        warn("Only one agent available — evaluator falls back to the "
+             "built-in numeric heuristic.")
 
     harness = ExecutionHarness(cwd=workdir, echo=not args.no_echo)
     metrics_path = workdir / args.metrics_file
@@ -597,6 +655,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     best_metrics: Optional[Dict[str, Any]] = None
     best_score: Optional[float] = None
     best_commit: Optional[str] = git.head_commit()
+    stagnation = 0  # consecutive trials without a commit (rotation trigger)
     pending_feedback = ""
     pending_diagnostic = ""
     final_result = "MAX_TRIALS_EXHAUSTED"
@@ -644,9 +703,54 @@ def main(argv: Optional[List[str]] = None) -> int:
     for trial in range(1, args.max_trials + 1):
         phase(f"Trial {trial}/{args.max_trials}")
 
+        # -- -1. Blind tournament: reassign seats when due -------------------
+        if rotate and (
+            trial == 1
+            or stagnation >= 2
+            or (args.tournament_every > 0 and trial > 1
+                and (trial - 1) % args.tournament_every == 0)
+        ):
+            info("Tournament: collecting anonymous proposals from "
+                 f"{', '.join(roster)}; panel judging follows...")
+            t_result = run_tournament(
+                agents=ask_agents(),
+                goal=args.goal,
+                trial=trial,
+                knowledge_context=knowledge_context(),
+                history_summary=logger.history_summary(),
+                last_feedback=pending_feedback,
+                mode=args.preset,
+                referee_notes="\n".join(
+                    f"- [{f['severity']}] {f['code']}: {f['detail']}"
+                    for f in recent_flags[-8:]),
+                incumbent=seat_editor,
+                log=info,
+            )
+            if t_result is None:
+                warn("Tournament inconclusive (not enough proposals or "
+                     "scores); keeping current seats.")
+                logger.record_event("TOURNAMENT_ABORTED", {"trial": trial})
+            else:
+                seat_editor = t_result.winner
+                seat_evaluator = (t_result.evaluator
+                                  if t_result.evaluator != t_result.winner
+                                  else seat_evaluator)
+                for agent_name, mean_score in t_result.ranking:
+                    info(f"  panel score — {agent_name}: {mean_score:.2f}")
+                success(f"Seats assigned — editor: {seat_editor}, "
+                        f"evaluator: {seat_evaluator or 'heuristic'}")
+                logger.record_event("TOURNAMENT",
+                                    {"trial": trial, **t_result.to_dict()})
+                pending_feedback = (
+                    "## Your winning tournament proposal — implement "
+                    "exactly this\n" + t_result.winning_proposal
+                    + (("\n\n" + pending_feedback) if pending_feedback
+                       else "")
+                )
+                stagnation = 0
+
         # -- 0. Context-budget checkpoint: rotate degraded sessions ----------
-        for name, sess in (("editor", editor_session),
-                           ("evaluator", evaluator_session)):
+        for name, sess in list(live_sessions.items()):
             if sess is None:
                 continue
             if sess.should_rotate():
@@ -669,7 +773,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             info(f"Context [{sess.status_line()}]")
 
         # -- 1. Editor modifies the code ------------------------------------
-        info("Editor (Claude Code): requesting code modification...")
+        info(f"Editor ({seat_editor}): requesting code modification...")
+        editor = editor_for(seat_editor)
+
+        def _metrics_sig() -> Optional[str]:
+            try:
+                return hashlib.sha1(metrics_path.read_bytes()).hexdigest()
+            except OSError:
+                return None
+        pre_edit_metrics_sig = _metrics_sig()
+
         try:
             editor_summary = editor.request_edit(
                 goal=args.goal,
@@ -690,12 +803,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 trial=trial, commit=git.head_commit(),
                 status="EDITOR_FAILED", action="SKIPPED", metrics=None,
                 evaluation=None, error_type="EDITOR_FAILURE",
+                editor_agent=seat_editor, evaluator_agent=seat_evaluator,
             )
             pending_diagnostic = ""
             pending_feedback = (
                 "The previous editor invocation failed at the CLI level; "
                 "no code was changed."
             )
+            stagnation += 1
             continue
 
         if not git.is_dirty():
@@ -710,13 +825,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 trial=trial, outcome="NO_CHANGES", action="SKIPPED",
                 val_loss=None, commit=None, editor_summary=editor_summary,
             )
+            stagnation += 1
             pending_feedback = (
                 "Your previous turn produced NO file modifications. You must "
                 "actually edit the source files, not just describe changes."
             )
             pending_diagnostic = ""
             continue
-        info(f"Modified files: {', '.join(git.changed_files())}")
+        changed_files = git.changed_files()
+        info(f"Modified files: {', '.join(changed_files)}")
 
         # -- 1.5 AST diff: what exactly changed this trial --------------------
         new_graph = CodeGraph.build(workdir)
@@ -728,6 +845,48 @@ def main(argv: Optional[List[str]] = None) -> int:
                 info(line)
         graph_state["current"] = new_graph
         new_graph.save(code_graph_path)
+
+        # -- 1.6 Referee: edit-phase rules ------------------------------------
+        edit_flags = ref.check_edit_phase(
+            changed_files,
+            metrics_file_written_during_edit=(
+                _metrics_sig() != pre_edit_metrics_sig),
+        )
+        for f in edit_flags:
+            (error if f.severity == FLAG_CRITICAL else warn)(
+                f"REFEREE [{f.severity}] {f.code}: {f.detail}")
+        recent_flags = (recent_flags
+                        + [f.to_dict() for f in edit_flags])[-12:]
+        if any(f.severity == FLAG_CRITICAL for f in edit_flags):
+            git.discard_changes()
+            warn("Referee force-reverted the edit; no run performed.")
+            logger.record_trial(
+                trial=trial, commit=None, status="REFEREE_BLOCKED",
+                action="REVERTED", metrics=None, evaluation=None,
+                editor_summary=editor_summary,
+                referee_flags=[f.to_dict() for f in edit_flags],
+                editor_agent=seat_editor, evaluator_agent=seat_evaluator,
+            )
+            kg.record_trial(
+                trial=trial, outcome="REFEREE_BLOCKED", action="REVERTED",
+                val_loss=None, commit=None, const_changes=const_changes,
+                func_changes=func_changes, editor_summary=editor_summary,
+            )
+            logger.record_event("REFEREE_BLOCK", {
+                "trial": trial, "editor": seat_editor,
+                "flags": [f.to_dict() for f in edit_flags],
+            })
+            graph_state["current"] = CodeGraph.build(workdir)
+            graph_state["current"].save(code_graph_path)
+            pending_feedback = (
+                "THE REFEREE BLOCKED your previous edit and it was "
+                "reverted:\n" + Referee.render(edit_flags)
+                + "\nFix the SOURCE code — never the tests or the "
+                "measurement."
+            )
+            pending_diagnostic = ""
+            stagnation += 1
+            continue
 
         # -- 2. Sandboxed evaluation run ---------------------------------------
         info(f"Runner: executing '{eval_command_display}' "
@@ -759,9 +918,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f"{metric_name}={fit.score:.4f} [{fit.detail}]{note}")
 
         # -- 3. Evaluator verdict ---------------------------------------------
-        info("Evaluator (Antigravity): analyzing metrics and dynamics...")
+        info(f"Evaluator ({seat_evaluator or 'numeric heuristic'}): "
+             "analyzing metrics and dynamics...")
+        try:
+            active_evaluator = evaluator_for(seat_evaluator)
+        except Exception:
+            active_evaluator = None
         evaluation = evaluate_run(
-            evaluator=evaluator,
+            evaluator=active_evaluator,
             goal=args.goal,
             goal_target=goal_target,
             trial=trial,
@@ -780,9 +944,47 @@ def main(argv: Optional[List[str]] = None) -> int:
             best_score=best_score,
             direction=direction,
             goal_op=preset["goal_op"],
+            evaluator_name=seat_evaluator or "",
         )
         info(f"Verdict: {evaluation.status} (via {evaluation.source})")
         info(f"Reasoning: {evaluation.reasoning[:300]}")
+
+        # -- 3.5 Referee: result-phase rules + verdict arbitration -------------
+        result_flags = ref.check_result_phase(
+            evaluation_status=evaluation.status,
+            measured=fit.measured,
+            score=fit.score,
+            best_score=best_score,
+            goal_met=fitness.goal_met(fit.score, goal_target),
+            is_better=fitness.is_better(fit.score, best_score),
+            repeated_dead_end=Referee.find_repeated_dead_end(
+                kg, const_changes),
+        )
+        for f in result_flags:
+            (error if f.severity == FLAG_CRITICAL else warn)(
+                f"REFEREE [{f.severity}] {f.code}: {f.detail}")
+        codes = {f.code for f in result_flags}
+        if "VERDICT_ON_CRASH" in codes:
+            evaluation.status = STATUS_CRASHED
+        elif "VERDICT_CONTRADICTION" in codes:
+            warn("Referee override: verdict downgraded to REGRESSED "
+                 "(numeric ground truth wins).")
+            evaluation.status = STATUS_REGRESSED
+        elif "PREMATURE_GOAL" in codes:
+            downgraded = STATUS_IMPROVED if fitness.is_better(
+                fit.score, best_score) else STATUS_REGRESSED
+            warn(f"Referee override: GOAL_REACHED downgraded to "
+                 f"{downgraded} (goal condition not met numerically).")
+            evaluation.status = downgraded
+        all_flags = edit_flags + result_flags
+        trial_flag_dicts = [f.to_dict() for f in all_flags]
+        recent_flags = (recent_flags
+                        + [f.to_dict() for f in result_flags])[-12:]
+        if result_flags:
+            logger.record_event("REFEREE_FLAGS", {
+                "trial": trial,
+                "flags": [f.to_dict() for f in result_flags],
+            })
 
         # -- 4. Git state decision ---------------------------------------------
         if evaluation.status == STATUS_GOAL_REACHED:
@@ -798,6 +1000,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 evaluation=evaluation.to_dict(),
                 editor_summary=editor_summary,
                 runtime_seconds=result.duration_seconds, score=fit.score,
+                referee_flags=trial_flag_dicts,
+                editor_agent=seat_editor, evaluator_agent=seat_evaluator,
             )
             kg.record_trial(
                 trial=trial, outcome=evaluation.status, action="GOAL_COMMIT",
@@ -824,6 +1028,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 evaluation=evaluation.to_dict(),
                 editor_summary=editor_summary,
                 runtime_seconds=result.duration_seconds, score=fit.score,
+                referee_flags=trial_flag_dicts,
+                editor_agent=seat_editor, evaluator_agent=seat_evaluator,
             )
             kg.record_trial(
                 trial=trial, outcome=evaluation.status, action="COMMITTED",
@@ -834,6 +1040,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             pending_feedback = format_feedback(evaluation)
             pending_diagnostic = ""
+            stagnation = 0
             continue
 
         # REGRESSED / CRASHED (or IMPROVED claimed on a crash) -> revert
@@ -854,6 +1061,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             editor_summary=editor_summary,
             error_type=result.error_type,
             runtime_seconds=result.duration_seconds, score=fit.score,
+            referee_flags=trial_flag_dicts,
+            editor_agent=seat_editor, evaluator_agent=seat_evaluator,
         )
         # The failed change is reverted on disk, but it lives on in the
         # knowledge graph as a dead-end fact so no future session (even a
@@ -869,7 +1078,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         graph_state["current"] = CodeGraph.build(workdir)  # reverted state
         graph_state["current"].save(code_graph_path)
         pending_feedback = format_feedback(evaluation)
+        if all_flags:
+            pending_feedback += ("\n\n## Referee flags on your trial\n"
+                                 + Referee.render(all_flags))
         pending_diagnostic = crash_diagnostic
+        stagnation += 1
         if crashed:
             pending_feedback += (
                 "\n\nNOTE: your previous edit was REVERTED because the run "
@@ -887,6 +1100,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     best = logger.best_trial()
     logger.finish_session(final_result, best["trial"] if best else None)
     print_trial_table(logger.trials)
+    seats_seen = {t["editor_agent"] for t in logger.trials
+                  if t.get("editor_agent")}
+    if seats_seen:
+        counts = Counter(
+            (t["editor_agent"], t.get("action")) for t in logger.trials
+            if t.get("editor_agent"))
+        info("Editor-seat record:")
+        for a in sorted(seats_seen):
+            commits = sum(v for (ag, act), v in counts.items()
+                          if ag == a and act in ("COMMITTED", "GOAL_COMMIT"))
+            reverts = sum(v for (ag, act), v in counts.items()
+                          if ag == a and act in ("REVERTED",))
+            info(f"  {a}: {commits} committed, {reverts} reverted")
     if best:
         best_obj = best.get("score") if best.get("score") is not None \
             else best.get("val_loss")
