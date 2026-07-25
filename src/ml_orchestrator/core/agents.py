@@ -214,13 +214,22 @@ class ClaudeEditor(_CLIAgent):
                 "trial (e.g. adjust LR schedule, change capacity, add "
                 "regularization) rather than many unrelated edits.",
             ]
+        if editable_files:
+            files_section = ("\n## Files you may edit\n"
+                             + "\n".join(f"- {f}" for f in editable_files))
+        else:
+            files_section = (
+                "\n## Files you may edit\nAny source file in this "
+                "workspace — EXCEPT test files, test fixtures, and the "
+                "evaluation harness itself (a referee inspects every diff "
+                "and reverts violations)."
+            )
         sections = [
             role,
             "",
             f"## Target goal\n{goal}",
             f"\n## Current trial\nTrial {trial}.",
-            "\n## Files you may edit\n"
-            + "\n".join(f"- {f}" for f in editable_files),
+            files_section,
             *constraints,
         ]
         if knowledge_context:

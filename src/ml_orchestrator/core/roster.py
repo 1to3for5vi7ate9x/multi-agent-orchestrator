@@ -76,13 +76,16 @@ def default_roster() -> Dict[str, AgentSpec]:
             ask_cmd=["agy", "-p"],
             session_adapter=lambda base: AntigravitySessionAdapter(base),
         ),
+        # --ignore-user-config: the Codex desktop app writes non-boolean
+        # keys into [features] in ~/.codex/config.toml, which hard-fails
+        # `codex exec` at config load. Auth still comes from CODEX_HOME.
         "codex": AgentSpec(
             name="codex",
             binary="codex",
-            edit_cmd=["codex", "exec", "-s", "workspace-write",
-                      "--skip-git-repo-check"],
-            ask_cmd=["codex", "exec", "-s", "read-only",
-                     "--skip-git-repo-check"],
+            edit_cmd=["codex", "exec", "--ignore-user-config",
+                      "-s", "workspace-write", "--skip-git-repo-check"],
+            ask_cmd=["codex", "exec", "--ignore-user-config",
+                     "-s", "read-only", "--skip-git-repo-check"],
             last_message_flag="-o",
             session_adapter=None,  # stateless in v1; resume support later
         ),

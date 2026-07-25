@@ -200,6 +200,7 @@ def run_tournament(
                     f"({len(text.split())} words)")
             else:
                 notes.append(f"{name}: empty proposal — excluded")
+                log(f"proposal from {name} was EMPTY — excluded")
         except Exception as exc:  # a dead CLI must not kill the loop
             notes.append(f"{name}: proposal failed ({exc}) — excluded")
             log(f"proposal from {name} failed: {exc}")

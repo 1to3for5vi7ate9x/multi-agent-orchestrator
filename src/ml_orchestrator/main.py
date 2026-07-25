@@ -82,6 +82,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
 
 try:
     from rich.console import Console
+    from rich.markup import escape as _esc
     from rich.panel import Panel
     from rich.rule import Rule
     from rich.table import Table
@@ -89,27 +90,27 @@ try:
     _console = Console()
 
     def banner(text: str) -> None:
-        _console.print(Panel.fit(text, border_style="cyan"))
+        _console.print(Panel.fit(_esc(text), border_style="cyan"))
 
     def phase(text: str) -> None:
-        _console.print(Rule(f"[bold cyan]{text}[/bold cyan]"))
+        _console.print(Rule(f"[bold cyan]{_esc(text)}[/bold cyan]"))
 
     def info(text: str) -> None:
-        _console.print(f"[white]•[/white] {text}")
+        _console.print(f"[white]•[/white] {_esc(text)}")
 
     def success(text: str) -> None:
-        _console.print(f"[bold green]✔[/bold green] {text}")
+        _console.print(f"[bold green]✔[/bold green] {_esc(text)}")
 
     def warn(text: str) -> None:
-        _console.print(f"[bold yellow]⚠[/bold yellow] {text}")
+        _console.print(f"[bold yellow]⚠[/bold yellow] {_esc(text)}")
 
     def error(text: str) -> None:
-        _console.print(f"[bold red]✘[/bold red] {text}")
+        _console.print(f"[bold red]✘[/bold red] {_esc(text)}")
 
     def print_trial_table(trials: List[Dict[str, Any]]) -> None:
         table = Table(title="Session results", header_style="bold cyan")
         for col, justify in (
-            ("Trial", "right"), ("Status", "left"), ("val_loss", "right"),
+            ("Trial", "right"), ("Status", "left"), ("score", "right"),
             ("Action", "left"), ("Commit", "left"),
         ):
             table.add_column(col, justify=justify)
@@ -205,8 +206,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Experiment workspace (must be / become a git repo).")
     p.add_argument("--metrics-file", default="metrics.json",
                    help="Structured metrics file the training script writes.")
-    p.add_argument("--python", default=sys.executable,
-                   help="Python interpreter used to run the training script.")
+    p.add_argument("--python", default=None,
+                   help="Interpreter for the evaluation command (default: "
+                        "the workspace's .venv python if present, else the "
+                        "current interpreter).")
     p.add_argument("--editable-files", nargs="*", default=None,
                    help="Files the Editor may modify (default: the training "
                         "script plus model.py/model_example.py if present).")
@@ -275,8 +278,8 @@ def scaffold_demo(workdir: Path) -> List[str]:
     return written
 
 
-def build_eval_command(args, preset: Dict[str, Any],
-                       workdir: Path) -> Optional[List[str]]:
+def build_eval_command(args, preset: Dict[str, Any], workdir: Path,
+                       python_bin: str) -> Optional[List[str]]:
     """Resolve the command that measures the objective each trial.
 
     Returns an argv list, or None when nothing sensible can be built.
@@ -289,12 +292,12 @@ def build_eval_command(args, preset: Dict[str, Any],
         if any((workdir / f).exists() for f in
                ("pytest.ini", "pyproject.toml", "setup.cfg", "tests",
                 "conftest.py")):
-            return [args.python, "-m", "pytest", "-q"]
+            return [python_bin, "-m", "pytest", "-q"]
         if (workdir / "package.json").exists():
             shell = ["cmd", "/c"] if os.name == "nt" else ["/bin/sh", "-c"]
             return shell + ["npm test --silent"]
         return None
-    return [args.python, args.train_script]
+    return [python_bin, args.train_script]
 
 
 def read_metrics(path: Path) -> Optional[Dict[str, Any]]:
@@ -323,13 +326,34 @@ def read_metrics(path: Path) -> Optional[Dict[str, Any]]:
     return data
 
 
-def default_editable_files(workdir: Path, train_script: str) -> List[str]:
+def default_editable_files(workdir: Path, train_script: str,
+                           preset: str) -> List[str]:
+    if preset == "coding":
+        # Whole-repo editing (minus tests, which the referee enforces);
+        # an empty list triggers the "any source file" prompt wording.
+        return []
     files = [train_script]
     for candidate in ("model.py", "model_example.py", "data.py",
                       "preprocess.py"):
         if (workdir / candidate).exists() and candidate not in files:
             files.append(candidate)
     return files
+
+
+def resolve_python(args, workdir: Path) -> str:
+    """Interpreter for the evaluation command.
+
+    Explicit --python wins; otherwise prefer the workspace's own venv
+    (uv projects), since under a uvx install sys.executable is an
+    ephemeral environment that has neither pytest nor the project deps.
+    """
+    if args.python:
+        return args.python
+    venv_python = workdir / ".venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
 
 
 def run_evaluation(
@@ -446,7 +470,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         error(f"Workspace {workdir} does not exist.")
         return 2
 
-    eval_command = build_eval_command(args, preset, workdir)
+    python_bin = resolve_python(args, workdir)
+    eval_command = build_eval_command(args, preset, workdir, python_bin)
     if eval_command is None:
         error("Could not determine an evaluation command for the coding "
               "preset. Pass one explicitly, e.g. "
@@ -484,10 +509,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     success(f"Git repository ready at HEAD {git.short(git.head_commit())}.")
 
-    editable = args.editable_files or default_editable_files(
-        workdir, args.train_script
-    )
-    info(f"Editable files: {', '.join(editable)}")
+    editable = args.editable_files if args.editable_files is not None \
+        else default_editable_files(workdir, args.train_script, args.preset)
+    info("Editable files: " + (", ".join(editable) if editable else
+         "any source file (tests are protected by the referee)"))
 
     # ---- Agent roster (claude / antigravity / codex) ----------------------
     try:
@@ -604,11 +629,37 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         return evaluator_cache[name]
 
-    def ask_agents() -> Dict[str, AskAgent]:
+    # Roster health: an agent whose text-only asks fail twice in a row is
+    # quarantined for the session so tournaments stop burning time on it.
+    ask_failures: Dict[str, int] = {}
+    quarantined: set = set()
+
+    class _TrackedAsk:
+        def __init__(self, inner: AskAgent) -> None:
+            self._inner = inner
+            self.name = inner.name
+
+        def ask(self, prompt: str) -> str:
+            try:
+                reply = self._inner.ask(prompt)
+            except Exception:
+                ask_failures[self.name] = ask_failures.get(self.name, 0) + 1
+                if (ask_failures[self.name] >= 2
+                        and self.name not in quarantined):
+                    quarantined.add(self.name)
+                    warn(f"Agent '{self.name}' quarantined for this "
+                         "session after repeated CLI failures.")
+                raise
+            ask_failures[self.name] = 0
+            return reply
+
+    def ask_agents() -> Dict[str, Any]:
         for name, spec in roster.items():
             if name not in ask_cache:
                 ask_cache[name] = AskAgent(spec, workdir, args.agent_timeout)
-        return ask_cache
+        return {name: _TrackedAsk(agent)
+                for name, agent in ask_cache.items()
+                if name not in quarantined}
 
     # Initial seats (tournament reassigns them when rotation is on).
     seat_editor = "claude" if "claude" in roster else next(iter(roster))
@@ -656,6 +707,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     best_score: Optional[float] = None
     best_commit: Optional[str] = git.head_commit()
     stagnation = 0  # consecutive trials without a commit (rotation trigger)
+    consecutive_noop = 0     # NO_CHANGES/EDITOR_FAILED streak (stall exit)
+    tournament_cooldown = 0  # trials to skip tournaments after an abort
     pending_feedback = ""
     pending_diagnostic = ""
     final_result = "MAX_TRIALS_EXHAUSTED"
@@ -703,8 +756,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     for trial in range(1, args.max_trials + 1):
         phase(f"Trial {trial}/{args.max_trials}")
 
+        # -- -2. Stall exit: repeated no-op trials mean the loop is blocked
+        # by something no edit can fix (bad eval env, impossible goal).
+        if consecutive_noop >= 3:
+            error("Three consecutive trials produced no edits — the loop "
+                  "is blocked by something outside the code (check the "
+                  "evaluation command / environment). Stopping early.")
+            final_result = "STALLED"
+            break
+
         # -- -1. Blind tournament: reassign seats when due -------------------
-        if rotate and (
+        if tournament_cooldown > 0:
+            tournament_cooldown -= 1
+        elif rotate and len(ask_agents()) >= 2 and (
             trial == 1
             or stagnation >= 2
             or (args.tournament_every > 0 and trial > 1
@@ -728,8 +792,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             if t_result is None:
                 warn("Tournament inconclusive (not enough proposals or "
-                     "scores); keeping current seats.")
+                     "scores); keeping current seats and pausing "
+                     "tournaments for 2 trials.")
                 logger.record_event("TOURNAMENT_ABORTED", {"trial": trial})
+                tournament_cooldown = 2
             else:
                 seat_editor = t_result.winner
                 seat_evaluator = (t_result.evaluator
@@ -811,6 +877,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "no code was changed."
             )
             stagnation += 1
+            consecutive_noop += 1
             continue
 
         if not git.is_dirty():
@@ -826,6 +893,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 val_loss=None, commit=None, editor_summary=editor_summary,
             )
             stagnation += 1
+            consecutive_noop += 1
             pending_feedback = (
                 "Your previous turn produced NO file modifications. You must "
                 "actually edit the source files, not just describe changes."
@@ -834,6 +902,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
         changed_files = git.changed_files()
         info(f"Modified files: {', '.join(changed_files)}")
+        consecutive_noop = 0  # the editor is acting; not a stalled loop
 
         # -- 1.5 AST diff: what exactly changed this trial --------------------
         new_graph = CodeGraph.build(workdir)
