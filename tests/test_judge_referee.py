@@ -126,6 +126,78 @@ res4 = run_tournament(agents=agents4, goal="g", trial=4,
 check("tie keeps incumbent", res4 is not None and res4.winner == "codex",
       res4 and res4.winner)
 
+# ---- parallel gathering + live status --------------------------------------------
+print("== parallel tournament + status board ==")
+import threading
+import time as _time
+
+class SlowAgent(FakeAgent):
+    def ask(self, prompt):
+        _time.sleep(0.3)
+        return super().ask(prompt)
+
+class RecordingStatus:
+    events = []
+    def __init__(self, title, agents):
+        self.title = title
+        RecordingStatus.events.append(("stage", title))
+    def update(self, agent, state, detail=""):
+        RecordingStatus.events.append((agent, state))
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        pass
+
+slow_agents = {
+    "claude": SlowAgent("claude", "CHANGE: lower the learning rate"),
+    "antigravity": SlowAgent("antigravity", "CHANGE: refactor io"),
+    "codex": SlowAgent("codex", "CHANGE: add weight decay"),
+}
+t0 = _time.monotonic()
+res_p = run_tournament(agents=slow_agents, goal="g", trial=1,
+                       knowledge_context="", history_summary="",
+                       last_feedback="", mode="ml",
+                       rng=random.Random(3), incumbent=None,
+                       status_factory=RecordingStatus)
+elapsed = _time.monotonic() - t0
+# 2 stages x 3 agents x 0.3s sequential would be ~1.8s; parallel ~0.6s.
+check("parallel speedup", res_p is not None and elapsed < 1.3,
+      f"{elapsed:.2f}s")
+check("parallel result correct", res_p.winner == "codex", res_p.winner)
+stages = [e[1] for e in RecordingStatus.events if e[0] == "stage"]
+check("two status stages", len(stages) == 2
+      and "proposals" in stages[0] and "judging" in stages[1], stages)
+for a in slow_agents:
+    seq = [s for (ag, s) in RecordingStatus.events if ag == a]
+    check(f"status transitions {a}",
+          seq.count("running") == 2 and seq.count("done") == 2, seq)
+
+# failure shows as failed state
+RecordingStatus.events = []
+mix = {
+    "claude": SlowAgent("claude", "CHANGE: lower the learning rate"),
+    "codex": FakeAgent("codex", "", fail=True),
+    "antigravity": SlowAgent("antigravity", "CHANGE: add weight decay"),
+}
+res_f = run_tournament(agents=mix, goal="g", trial=1,
+                       knowledge_context="", history_summary="",
+                       last_feedback="", mode="ml",
+                       rng=random.Random(3), status_factory=RecordingStatus)
+codex_states = [s for (ag, s) in RecordingStatus.events if ag == "codex"]
+check("failure marked failed", "failed" in codex_states, codex_states)
+check("tournament survives failure", res_f is not None
+      and res_f.winner == "antigravity", res_f and res_f.winner)
+
+from ml_orchestrator.core.live_status import LiveStatus, NullStatus
+with LiveStatus("demo", ["a", "b"]) as ls:  # non-TTY -> plain mode, no crash
+    ls.update("a", "running")
+    ls.update("a", "done", "ok")
+    ls.update("b", "failed", "boom")
+check("LiveStatus non-tty safe", True)
+with NullStatus("x", []) as ns:
+    ns.update("a", "done")
+check("NullStatus noop", True)
+
 # ---- referee -------------------------------------------------------------------
 print("== referee ==")
 check("test path detection",

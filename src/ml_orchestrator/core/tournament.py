@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import kernel
+from .live_status import DONE, FAILED, RUNNING, NullStatus
 
 # Vendor/self-identifying strings scrubbed before judging.
 _IDENTITY_RE = re.compile(
@@ -166,6 +168,40 @@ def parse_scores(raw: str, labels: Sequence[str]) -> Optional[Dict[str, float]]:
 
 
 # ---------------------------------------------------------------------------
+# Parallel gathering
+# ---------------------------------------------------------------------------
+
+def _gather_parallel(
+    agents: Dict[str, Any],
+    prompt: str,
+    status: Any,
+) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    """Ask every agent concurrently. Returns name -> (text, error);
+    exactly one of the pair is None. The status board is updated live."""
+    results: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(agents))) as pool:
+        futures = {}
+        for name, agent in agents.items():
+            status.update(name, RUNNING)
+            futures[pool.submit(agent.ask, prompt)] = name
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                text = (fut.result() or "").strip()
+            except Exception as exc:  # dead CLI must not kill the loop
+                results[name] = (None, str(exc))
+                status.update(name, FAILED, str(exc).splitlines()[0][:80])
+                continue
+            if text:
+                results[name] = (text, None)
+                status.update(name, DONE, f"{len(text):,} chars")
+            else:
+                results[name] = (None, "empty reply")
+                status.update(name, FAILED, "empty reply")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # The tournament
 # ---------------------------------------------------------------------------
 
@@ -181,29 +217,38 @@ def run_tournament(
     rng: Optional[random.Random] = None,
     incumbent: Optional[str] = None,
     log=lambda msg: None,
+    status_factory: Optional[Callable[[str, List[str]], Any]] = None,
 ) -> Optional[TournamentResult]:
     """Run one blind tournament. Returns None when fewer than two agents
-    produced proposals (in which case the caller keeps the incumbent)."""
+    produced proposals (in which case the caller keeps the incumbent).
+
+    Both stages (proposals, panel judging) run all agents IN PARALLEL;
+    ``status_factory(title, agent_names)`` supplies a live status board
+    (see live_status.LiveStatus) so the user watches each CLI's state
+    and elapsed time instead of a silent gap."""
     rng = rng or random.Random()
+    status_factory = status_factory or NullStatus
     notes: List[str] = []
 
-    # 1. Collect proposals.
+    # 1. Collect proposals — all agents concurrently.
     proposals: List[Proposal] = []
     prompt = build_proposal_prompt(goal, trial, knowledge_context,
                                    history_summary, last_feedback, mode)
-    for name, agent in agents.items():
-        try:
-            text = agent.ask(prompt).strip()
-            if text:
-                proposals.append(Proposal(name, text))
-                log(f"proposal received from {name} "
-                    f"({len(text.split())} words)")
-            else:
-                notes.append(f"{name}: empty proposal — excluded")
-                log(f"proposal from {name} was EMPTY — excluded")
-        except Exception as exc:  # a dead CLI must not kill the loop
-            notes.append(f"{name}: proposal failed ({exc}) — excluded")
-            log(f"proposal from {name} failed: {exc}")
+    with status_factory("Tournament — anonymous proposals (parallel)",
+                        list(agents)) as status:
+        gathered = _gather_parallel(agents, prompt, status)
+    for name in agents:
+        text, err = gathered.get(name, (None, "no result"))
+        if text:
+            proposals.append(Proposal(name, text))
+            log(f"proposal received from {name} "
+                f"({len(text.split())} words)")
+        elif err == "empty reply":
+            notes.append(f"{name}: empty proposal — excluded")
+            log(f"proposal from {name} was EMPTY — excluded")
+        else:
+            notes.append(f"{name}: proposal failed ({err}) — excluded")
+            log(f"proposal from {name} failed: {err}")
     if len(proposals) < 2:
         notes.append("fewer than 2 proposals; tournament aborted")
         return None
@@ -215,22 +260,27 @@ def run_tournament(
     labeled = [(label, scrub_identity(p.text))
                for label, p in zip(labels, proposals)]
 
-    # 3. Panel judging — every agent scores all candidates.
+    # 3. Panel judging — every agent scores all candidates, concurrently.
     judge_prompt = build_judge_prompt(goal, labeled, knowledge_context,
                                       referee_notes)
     judge_scores: Dict[str, Dict[str, float]] = {}
-    for name, agent in agents.items():
-        try:
-            raw = agent.ask(judge_prompt)
-            parsed = parse_scores(raw, labels)
-            if parsed:
-                judge_scores[name] = parsed
-                log(f"judge {name}: " + " ".join(
-                    f"{k}={v:g}" for k, v in sorted(parsed.items())))
-            else:
-                notes.append(f"judge {name}: unparseable scores — ignored")
-        except Exception as exc:
-            notes.append(f"judge {name}: failed ({exc}) — ignored")
+    with status_factory("Tournament — blind panel judging (parallel)",
+                        list(agents)) as status:
+        gathered = _gather_parallel(agents, judge_prompt, status)
+    for name in agents:
+        raw, err = gathered.get(name, (None, "no result"))
+        if raw is None:
+            notes.append(f"judge {name}: failed ({err}) — ignored")
+            log(f"judge {name} failed: {err}")
+            continue
+        parsed = parse_scores(raw, labels)
+        if parsed:
+            judge_scores[name] = parsed
+            log(f"judge {name}: " + " ".join(
+                f"{k}={v:g}" for k, v in sorted(parsed.items())))
+        else:
+            notes.append(f"judge {name}: unparseable scores — ignored")
+            log(f"judge {name}: unparseable scores — ignored")
     if not judge_scores:
         notes.append("no judge produced scores; tournament aborted")
         return None

@@ -49,6 +49,20 @@ Tournaments run at trial 1, again whenever the incumbent editor goes
 **2 consecutive trials without a commit**, and optionally every N
 trials (`--tournament-every N`).
 
+Both stages run **all agents in parallel** (one thread per CLI), with a
+live status board on the terminal — per agent: spinner, state, ticking
+elapsed clock, and the result or failure reason:
+
+```
+  Tournament — anonymous proposals (parallel)
+  ⠹ claude        running    0:47
+  ✔ antigravity   done       0:31  1,480 chars
+  ✘ codex         failed     0:02  exited 1: Error loading config...
+```
+
+On pipes/CI the board degrades to plain state-transition lines so logs
+stay greppable.
+
 **Ground truth stays king.** The judge only decides *who drives*.
 Commit/revert decisions are still made by the objective fitness signal
 (val_loss / failing tests), the evaluator verdict, and the referee —

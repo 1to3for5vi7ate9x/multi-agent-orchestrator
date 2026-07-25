@@ -43,6 +43,7 @@ from .core import (
 from .core import CodeGraph, ExperimentKnowledgeGraph, format_changes
 from .core import AskAgent, Referee, resolve_roster, run_tournament
 from .core.agents import heuristic_evaluation, parse_goal_target
+from .core.live_status import LiveStatus
 from .core.referee import CRITICAL as FLAG_CRITICAL
 from .core.git_manager import DEFAULT_IGNORES
 from .core.runner import ExecutionHarness as Harness  # alias for clarity
@@ -789,6 +790,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     for f in recent_flags[-8:]),
                 incumbent=seat_editor,
                 log=info,
+                status_factory=LiveStatus,
             )
             if t_result is None:
                 warn("Tournament inconclusive (not enough proposals or "
