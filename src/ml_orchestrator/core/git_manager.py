@@ -134,6 +134,11 @@ class GitManager:
         _, out, _ = self._git("status", "--porcelain")
         return bool(out.strip())
 
+    def untracked_files(self) -> List[str]:
+        """Untracked, non-ignored files (relative paths)."""
+        _, out, _ = self._git("ls-files", "--others", "--exclude-standard")
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
     def changed_files(self) -> List[str]:
         # diff vs HEAD covers staged + unstaged edits; ls-files adds new
         # untracked files. Avoids fragile porcelain column parsing.

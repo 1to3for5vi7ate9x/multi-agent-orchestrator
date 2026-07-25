@@ -393,7 +393,15 @@ class ManagedSession:
                 f"{proc.returncode}:\n"
                 f"{(proc.stderr or proc.stdout).strip()[:2000]}"
             )
-        return self.adapter.parse(proc.stdout)
+        reply = self.adapter.parse(proc.stdout)
+        if not reply.text.strip() and proc.stderr.strip():
+            # e.g. agy headless: tool permission auto-denied -> empty
+            # stdout with the explanation on stderr.
+            raise AgentError(
+                f"Agent CLI {command[0]!r} produced no output; "
+                f"stderr: {proc.stderr.strip()[:600]}"
+            )
+        return reply
 
     # -- rotation --------------------------------------------------------------------
 

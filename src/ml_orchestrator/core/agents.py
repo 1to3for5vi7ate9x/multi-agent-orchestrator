@@ -132,7 +132,15 @@ class _CLIAgent:
                 f"Agent CLI {self.base_command[0]!r} exited with code "
                 f"{proc.returncode}:\n{(proc.stderr or proc.stdout).strip()[:2000]}"
             )
-        return captured or proc.stdout.strip()
+        text = captured or proc.stdout.strip()
+        if not text and proc.stderr.strip():
+            # e.g. agy headless: tool permission auto-denied -> empty
+            # stdout, explanation on stderr. Surface it, don't swallow it.
+            raise AgentError(
+                f"Agent CLI {self.base_command[0]!r} produced no output; "
+                f"stderr: {proc.stderr.strip()[:600]}"
+            )
+        return text
 
 
 # --------------------------------------------------------------------------

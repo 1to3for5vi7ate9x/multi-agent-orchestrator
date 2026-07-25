@@ -848,6 +848,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             except OSError:
                 return None
         pre_edit_metrics_sig = _metrics_sig()
+        pre_edit_untracked = set(git.untracked_files())
+
+        def remove_editor_debris() -> None:
+            """Delete untracked files the editor created this trial.
+
+            `git checkout -- .` only restores tracked files; an editor's
+            new untracked files would otherwise survive the revert and
+            pollute every later trial's diff (a leftover tests/conftest.py
+            caused a false TEST_TAMPERING block in the dogfood run).
+            """
+            debris = set(git.untracked_files()) - pre_edit_untracked
+            for rel in sorted(debris):
+                target = (workdir / rel).resolve()
+                if not str(target).startswith(str(workdir)):
+                    continue
+                try:
+                    target.unlink()
+                    info(f"Removed editor debris: {rel}")
+                except OSError as exc:
+                    warn(f"Could not remove editor debris {rel}: {exc}")
 
         try:
             editor_summary = editor.request_edit(
@@ -928,6 +948,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         + [f.to_dict() for f in edit_flags])[-12:]
         if any(f.severity == FLAG_CRITICAL for f in edit_flags):
             git.discard_changes()
+            remove_editor_debris()
             warn("Referee force-reverted the edit; no run performed.")
             logger.record_trial(
                 trial=trial, commit=None, status="REFEREE_BLOCKED",
@@ -1115,6 +1136,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # REGRESSED / CRASHED (or IMPROVED claimed on a crash) -> revert
         try:
             git.discard_changes()
+            remove_editor_debris()
             warn(f"Changes reverted; workspace restored to "
                  f"{git.short(git.head_commit())}.")
         except GitError as exc:

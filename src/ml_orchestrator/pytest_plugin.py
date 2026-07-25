@@ -12,12 +12,13 @@ execution model as tests/run_all.py. The item passes iff the script exits
 0, so failures propagate honestly. Ordinary pytest-style modules are left
 to native collection untouched.
 
-Loaded two ways: the `pytest11` entry point (effective once the
-distribution's metadata is rebuilt on install) and `-p
-ml_orchestrator.pytest_plugin` via addopts in pyproject.toml, which works
-immediately in an editable checkout. The entry point is named with the
-full import path so pytest recognizes both registrations as the same
-plugin and does not register it twice.
+Loaded via `-p ml_orchestrator.pytest_plugin` in this repo's pyproject
+addopts — deliberately NOT a global pytest11 entry point, so installing
+the ml-agent-orchestrator package never changes pytest behavior in
+other projects.
+
+(Originally authored by the orchestrator's own tri-agent loop — trial 4,
+commit c7e6c55 — with the entry-point scope amended in review.)
 """
 from __future__ import annotations
 

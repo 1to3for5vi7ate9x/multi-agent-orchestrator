@@ -31,13 +31,6 @@ ml-orchestrator = "ml_orchestrator.main:main"
 # works without --from.
 ml-agent-orchestrator = "ml_orchestrator.main:main"
 
-[project.entry-points.pytest11]
-# Bridges the script-style suites in tests/ (module-level sys.exit) into
-# pytest collection; see src/ml_orchestrator/pytest_plugin.py. Named with
-# the full import path so the addopts `-p` load below is recognized as the
-# same plugin and not registered twice.
-"ml_orchestrator.pytest_plugin" = "ml_orchestrator.pytest_plugin"
-
 [project.urls]
 Homepage = "https://github.com/1to3for5vi7ate9x/multi-agent-orchestrator"
 Repository = "https://github.com/1to3for5vi7ate9x/multi-agent-orchestrator"
@@ -51,8 +44,10 @@ build-backend = "hatchling.build"
 packages = ["src/ml_orchestrator"]
 
 [tool.pytest.ini_options]
-# Load the script-suite bridge by import path so it works in an editable
-# checkout even when the installed entry-point metadata is stale.
+# Load the script-suite bridge (authored by the orchestrator loop itself,
+# trial-4 commit c7e6c55) by import path. Deliberately NOT a pytest11
+# entry point: that would auto-load the plugin into every pytest run of
+# every user who installs this package; addopts scopes it to this repo.
 addopts = "-p ml_orchestrator.pytest_plugin"
 
 [tool.uv]

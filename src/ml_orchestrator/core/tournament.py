@@ -109,7 +109,7 @@ HYPOTHESIS: <why the current bottleneck in {domain} exists — one dense paragra
 CHANGE: <the precise edit you would make: files, functions/constants, old->new values where applicable>
 EXPECTED: <the measurable effect on the objective and the risk if wrong>
 
-Rules: be specific, never propose anything listed as a dead end, do not mention what model or product you are."""
+Rules: answer DIRECTLY from the context given above — do NOT use tools, do NOT read files, do NOT run commands (tool use is auto-denied in this mode and produces an empty answer). Be specific, never propose anything listed as a dead end, and do not mention what model or product you are."""
 
 
 JUDGE_RUBRIC = """Score each candidate proposal from 1-10 using this rubric (weights in brackets):
@@ -141,7 +141,7 @@ def build_judge_prompt(
 ## Candidates
 {blocks}
 
-## Response format — respond with EXACTLY these two lines and nothing else
+## Response format — respond with EXACTLY these two lines and nothing else (answer directly; do NOT use tools, read files, or run commands)
 SCORES: {" ".join(f"{label}=<1-10>" for label, _ in labeled)}
 REASON: <one paragraph justifying the ranking>"""
 
