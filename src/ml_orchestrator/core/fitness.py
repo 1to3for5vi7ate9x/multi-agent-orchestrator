@@ -75,6 +75,15 @@ def parse_test_results(output: str) -> Optional[Dict[str, int]]:
         failed = (int(fm.group(1)) if fm else 0) + (int(em.group(1)) if em else 0)
         return {"failed": failed, "passed": passed}
 
+    # mocha:  "  12 passing (340ms)" / "  3 failing"
+    mp = re.search(r"^\s*(\d+)\s+passing\b", output, re.MULTILINE)
+    mf = re.search(r"^\s*(\d+)\s+failing\b", output, re.MULTILINE)
+    if mp or mf:
+        return {
+            "failed": int(mf.group(1)) if mf else 0,
+            "passed": int(mp.group(1)) if mp else 0,
+        }
+
     # go test: count FAIL lines vs the presence of "ok"
     go_fails = re.findall(r"^(?:---\s+)?FAIL(?::|\s)", output, re.MULTILINE)
     go_ok = re.search(r"^ok\s+\S+", output, re.MULTILINE)
