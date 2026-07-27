@@ -65,6 +65,98 @@ Every trial is recorded in `experiments_history.json`; a markdown
 
 ---
 
+## What it's for (and what it isn't)
+
+The loop is driven by an **objective fitness signal**, so it only works
+where one already exists. That makes it a *refinement* engine, not a
+scaffolding engine: it is good at "here is a precise, measurable
+definition of done — get there", and has nothing to optimize against
+when asked to "build me a thing".
+
+For code, writing the fitness function means **writing the tests first**.
+
+### Works well
+
+| Use case | Fitness signal | Shape |
+|----------|----------------|-------|
+| **Test-first feature work** | failing tests → 0 | write the spec as failing tests, let the loop implement |
+| **Bug fixing** | a reproducing test → green | usually converges in 1–2 trials |
+| **ML experimentation** | `val_loss` from `metrics.json` | the original preset |
+| **Any numeric objective** | `score` from `metrics.json` | latency, bundle size, memory, Lighthouse, accuracy |
+| **Migrations / ports** | the existing suite stays green | tests are the behavioral oracle |
+
+Test-first feature work is the canonical shape:
+
+```bash
+git checkout -b agent/pagination
+# write tests/test_pagination.py describing the API you want — it must FAIL
+uv run ml-orchestrator --preset coding \
+  --goal "Implement cursor pagination so tests/test_pagination.py passes" \
+  --editable-files api/pagination.py api/views.py \
+  --max-trials 8
+```
+
+The referee guarantees it fixes the code rather than the test;
+`--editable-files` keeps it from wandering across a large repo.
+
+Any number you can emit is optimizable, which is the most underused mode:
+
+```bash
+# bench.py writes {"score": <p95 latency in ms>}
+uv run ml-orchestrator --preset ml \
+  --goal "Get p95 latency under 120ms" \
+  --eval-command "python bench.py" --max-trials 10
+```
+
+Use `--direction maximize` where higher is better.
+
+### Doesn't work
+
+- **Greenfield project creation** — there is no signal before tests exist.
+- **Subjective goals** — UI design, API ergonomics, prose quality. Nothing
+  to minimize.
+- **Broad multi-file refactors** — a green suite cannot tell "refactored
+  well" from "barely touched".
+
+> [!WARNING]
+> **The empty-project trap.** In the coding preset a command that exits 0
+> with no parseable test output scores `0.0`, which satisfies
+> `failing_tests <= 0`. Point the loop at a project with no tests and it
+> reports `Baseline already satisfies the goal — nothing to do` and exits
+> 0 having changed nothing. **Always read the baseline line**: if it does
+> not show a real failing count, the run is meaningless.
+
+### Starting a new project
+
+Bootstrap by hand; hand over once there is a signal.
+
+1. **Phase 0 — you.** Scaffold, dependencies, a runnable test command, and
+   the first spec-as-tests. The orchestrator is the wrong tool here; use
+   an interactive coding agent.
+2. **Phase 1 — one feature per run.** Branch, failing tests, run. Keep
+   `--max-trials` at 6–10: it either converges in 1–3 trials or it is
+   stuck on something no edit can fix (the loop gives up with `STALLED`
+   after 3 consecutive no-op trials).
+3. **Phase 2 — non-functional goals.** Once it works, switch to numeric
+   objectives for performance.
+
+Practical notes:
+
+- **Cost scales at 2N agent calls per tournament** (6 with three agents).
+  For a small, well-scoped task, `--no-rotate` skips the tournament and
+  lets one agent drive — often the better trade.
+- **Tournament proposals are written blind**: agents may not read files
+  during the proposal stage, so on trial 1 in an unfamiliar repo the panel
+  is ranking speculation. It pays off over longer runs, once the knowledge
+  graph carries real outcome facts.
+- **Scope the eval command.** Auto-detection runs your whole suite; on a
+  big repo pass `--eval-command "pytest -q tests/test_feature.py"` so
+  every trial isn't paying for the full run.
+- **Memory persists across runs** in `--memory-dir`, so dead ends carry
+  forward between sessions on the same workspace.
+
+---
+
 ## Prerequisites
 
 1. **[uv](https://docs.astral.sh/uv/)** and **git** on PATH. uv manages
