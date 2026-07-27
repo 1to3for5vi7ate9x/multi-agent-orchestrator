@@ -2,7 +2,7 @@
   "comment": "Golden vectors for the judge/referee decision kernel. Both the Haskell kernel (haskell/) and the Python fallback (core/tournament.py + core/referee.py) must produce these outcomes. Flag comparisons check code+severity (detail wording may differ); aggregate comparisons check ranking order, scores (±1e-6), winner and evaluator.",
   "vectors": [
     {
-      "name": "aggregate: clear winner",
+      "name": "aggregate: clear winner (3 judges, self-scores excluded)",
       "request": {
         "op": "aggregate",
         "labels": ["A", "B", "C"],
@@ -17,7 +17,7 @@
       "expect": {
         "winner": "codex",
         "evaluator": "claude",
-        "ranking": [["codex", 8.666666666666666], ["claude", 7.0], ["antigravity", 4.333333333333333]]
+        "ranking": [["codex", 8.5], ["claude", 7.0], ["antigravity", 4.0]]
       }
     },
     {
@@ -163,6 +163,131 @@
         "goal_met": false,
         "is_better": true,
         "repeated_dead_end": null
+      },
+      "expect": {
+        "flags": []
+      }
+    },
+    {
+      "name": "aggregate: self-scores excluded with 3 judges (each inflates itself)",
+      "request": {
+        "op": "aggregate",
+        "labels": ["A", "B", "C"],
+        "label_map": {"A": "claude", "B": "antigravity", "C": "codex"},
+        "judge_scores": {
+          "claude": {"A": 10, "B": 6, "C": 6},
+          "antigravity": {"A": 5, "B": 7, "C": 5},
+          "codex": {"A": 5, "B": 5, "C": 7}
+        },
+        "incumbent": null
+      },
+      "expect": {
+        "winner": "antigravity",
+        "evaluator": "codex",
+        "ranking": [["antigravity", 5.5], ["codex", 5.5], ["claude", 5.0]]
+      }
+    },
+    {
+      "name": "aggregate: two judges keep their self-scores (panel too small)",
+      "request": {
+        "op": "aggregate",
+        "labels": ["A", "B"],
+        "label_map": {"A": "claude", "B": "codex"},
+        "judge_scores": {
+          "claude": {"A": 10, "B": 4},
+          "codex": {"A": 4, "B": 10}
+        },
+        "incumbent": "claude"
+      },
+      "expect": {
+        "winner": "claude",
+        "evaluator": "codex",
+        "ranking": [["claude", 7.0], ["codex", 7.0]]
+      }
+    },
+    {
+      "name": "aggregate: owner-only score survives exclusion via fallback",
+      "request": {
+        "op": "aggregate",
+        "labels": ["A", "B", "C"],
+        "label_map": {"A": "claude", "B": "antigravity", "C": "codex"},
+        "judge_scores": {
+          "claude": {"A": 8, "B": 6, "C": 6},
+          "antigravity": {"B": 9},
+          "codex": {"B": 3, "C": 5}
+        },
+        "incumbent": null
+      },
+      "expect": {
+        "winner": "claude",
+        "evaluator": "codex",
+        "ranking": [["claude", 8.0], ["codex", 6.0], ["antigravity", 4.5]]
+      }
+    },
+    {
+      "name": "review_edit: hardcoded objective value flagged in ml mode",
+      "request": {
+        "op": "review_edit",
+        "mode": "ml",
+        "metrics_file": "metrics.json",
+        "changed_files": ["train.py"],
+        "metrics_written": false,
+        "literal_metric_writes": ["train.py: json.dump() of a hardcoded val_loss=0.001"]
+      },
+      "expect": {
+        "flags": [{"code": "METRIC_FABRICATION", "severity": "WARN"}]
+      }
+    },
+    {
+      "name": "review_result: reaching the goal is not a suspicious jump",
+      "request": {
+        "op": "review_result",
+        "direction": "minimize",
+        "status": "GOAL_REACHED",
+        "measured": true,
+        "score": 0.0,
+        "best_score": 10.0,
+        "goal_met": true,
+        "is_better": true,
+        "repeated_dead_end": null
+      },
+      "expect": {
+        "flags": []
+      }
+    },
+    {
+      "name": "review_result: runtime collapse while improving",
+      "request": {
+        "op": "review_result",
+        "direction": "minimize",
+        "status": "IMPROVED",
+        "measured": true,
+        "score": 0.1,
+        "best_score": 0.4,
+        "goal_met": false,
+        "is_better": true,
+        "repeated_dead_end": null,
+        "duration_seconds": 2.0,
+        "baseline_duration_seconds": 120.0
+      },
+      "expect": {
+        "flags": [{"code": "RUNTIME_COLLAPSE", "severity": "WARN"}]
+      }
+    },
+    {
+      "name": "review_result: proportionate runtime is not flagged",
+      "request": {
+        "op": "review_result",
+        "direction": "minimize",
+        "status": "IMPROVED",
+        "measured": true,
+        "score": 0.35,
+        "best_score": 0.4,
+        "goal_met": false,
+        "is_better": true,
+        "repeated_dead_end": null,
+        "duration_seconds": 100.0,
+        "baseline_duration_seconds": 120.0
       },
       "expect": {
         "flags": []

@@ -172,6 +172,32 @@ with tempfile.TemporaryDirectory() as td:
     check("kg persistence", len(kg2.facts) == len(kg.facts)
           and kg2.best_trial()[0] == 3)
 
+    # Direction awareness: this layer is presented to agents as ground
+    # truth, so a hardcoded min() reported the WORST trial as "best so
+    # far" in every prompt under a maximize objective.
+    kg_max = ExperimentKnowledgeGraph(td / "kg.json", direction="maximize",
+                                      metric_name="accuracy")
+    best_max = kg_max.best_trial()
+    check("maximize picks highest", best_max[0] == 0, best_max)
+    check("minimize picks lowest", kg.best_trial()[0] == 3)
+    ctx_max = kg_max.render_context()
+    check("context labels the metric",
+          "accuracy=0.4000" in ctx_max and "maximize" in ctx_max, ctx_max)
+    check("context labels minimize metric",
+          "val_loss=0.2000" in kg.render_context(), kg.render_context())
+
+    # Reads tolerate either persisted key; writes stay on 'val_loss' so
+    # graphs from earlier runs keep loading.
+    raw = json.loads((td / "kg.json").read_text())
+    check("still persisted as val_loss",
+          raw["trials"]["3"]["val_loss"] == 0.20, raw["trials"]["3"])
+    raw["trials"]["4"] = {"outcome": "IMPROVED", "action": "COMMITTED",
+                          "score": 0.05, "commit": "c4"}
+    (td / "kg.json").write_text(json.dumps(raw))
+    kg_score = ExperimentKnowledgeGraph(td / "kg.json")
+    check("reads 'score' key too", kg_score.best_trial()[0] == 4,
+          kg_score.best_trial())
+
     # corrupt file tolerated
     (td / "kg.json").write_text("{{{")
     kg3 = ExperimentKnowledgeGraph(td / "kg.json")

@@ -27,7 +27,8 @@ import Data.Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
-import Data.List (isInfixOf, isSuffixOf, sortBy)
+import Data.Char (isAlphaNum)
+import Data.List (isPrefixOf, isSuffixOf, sortBy)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Ord (Down (..), comparing)
@@ -104,20 +105,33 @@ flag code sev detail =
 -- aggregate — judge panel aggregation + seat assignment
 -- ---------------------------------------------------------------------------
 
+-- SPEC: see the block comment above `aggregate_scores` in
+-- src/ml_orchestrator/core/tournament.py. A judge scoring its own
+-- anonymized candidate is the one bias blind labelling cannot remove,
+-- so self-scores are dropped once the panel has >= 3 voices. The
+-- fallback in `meanFor` keeps a candidate in the ranking when its owner
+-- was the only judge to score it.
 aggregate :: Value -> Value
 aggregate req =
-  let labels     = getStrings "labels" req
-      labelMap   = getStrMap "label_map" req
-      judges     = getScoreMap "judge_scores" req
-      incumbent  = getString "incumbent" req
-      -- mean score per label across all judges that scored it
-      meanFor l  = let vals = mapMaybe (M.lookup l) (M.elems judges)
-                   in if null vals then Nothing
-                      else Just (sum vals / fromIntegral (length vals))
+  let labels      = getStrings "labels" req
+      labelMap    = getStrMap "label_map" req
+      judges      = getScoreMap "judge_scores" req
+      incumbent   = getString "incumbent" req
+      excludeSelf = M.size judges >= 3
+      scoresFor l = [ (judge, v)
+                    | (judge, m) <- M.toList judges
+                    , Just v <- [M.lookup l m] ]
+      meanFor l owner =
+        let scored = scoresFor l
+            kept   = [ v | (j, v) <- scored
+                         , not (excludeSelf && j == owner) ]
+            vals   = if null kept then map snd scored else kept
+        in if null vals then Nothing
+           else Just (sum vals / fromIntegral (length vals))
       agentMeans = [ (agent, m)
                    | l <- labels
                    , Just agent <- [M.lookup l labelMap]
-                   , Just m <- [meanFor l] ]
+                   , Just m <- [meanFor l agent] ]
       ranking    = sortBy (comparing (Down . snd)) agentMeans
   in case ranking of
        [] -> object ["error" .= ("no scores" :: T.Text)]
@@ -141,16 +155,27 @@ aggregate req =
 -- review_edit — referee rules for the edit phase
 -- ---------------------------------------------------------------------------
 
+-- | Must agree with `_TEST_PATH_RE` in
+-- src/ml_orchestrator/core/referee.py on EVERY path — that regex is the
+-- spec, this is the port, and tests/test_paths.json is the shared corpus
+-- both are checked against.
+--
+-- The subtlety that matters is the regex's @\\b@ before test/tests: an
+-- earlier version of this function used a plain infix search, which made
+-- @latest_thing.py@, @fastest_run.py@ and @contest_form.py@ read as test
+-- files. In coding mode that is a CRITICAL flag and a forced revert, so
+-- the two implementations disagreeing here meant ordinary source edits
+-- were destroyed whenever the compiled kernel happened to be installed.
 isTestPath :: T.Text -> Bool
 isTestPath t =
-  let p    = T.unpack t
-      base = reverse (takeWhile (/= '/') (reverse p))
+  let p    = T.unpack (T.strip t)
       segs = wordsBy '/' p
-  in any (`elem` segs) ["test", "tests"]
+      dirs = if null segs then [] else init segs
+      base = if null segs then "" else last segs
+  in any (`elem` ["test", "tests"]) dirs
      || base == "conftest.py"
      || base == "pytest.ini"
-     || (("test_" `isInfixOf` base || "tests_" `isInfixOf` base)
-         && ".py" `isSuffixOf` base)
+     || (".py" `isSuffixOf` base && hasBoundaryTest base)
      || "_test.py" `isSuffixOf` base
      || "_tests.py" `isSuffixOf` base
      || any (`isSuffixOf` base)
@@ -158,8 +183,18 @@ isTestPath t =
           ".spec.js", ".spec.ts", ".spec.jsx", ".spec.tsx"]
   where
     wordsBy c s = case break (== c) s of
-      (w, [])      -> [w]
+      (w, [])       -> [w]
       (w, _ : rest) -> w : wordsBy c rest
+    isWordChar ch = isAlphaNum ch || ch == '_'
+    -- Equivalent of \btest_ / \btests_ : an occurrence whose preceding
+    -- character is not a word character (or which starts the string).
+    hasBoundaryTest s = go True s
+      where
+        go _ [] = False
+        go atBoundary rest@(c : cs)
+          | atBoundary
+          , "test_" `isPrefixOf` rest || "tests_" `isPrefixOf` rest = True
+          | otherwise = go (not (isWordChar c)) cs
 
 reviewEdit :: Value -> Value
 reviewEdit req =
@@ -167,6 +202,7 @@ reviewEdit req =
       metricsFile   = fromMaybe "metrics.json" (getString "metrics_file" req)
       changed       = getStrings "changed_files" req
       metricsWrote  = getBool "metrics_written" req
+      literalWrites = getStrings "literal_metric_writes" req
       touchedTests  = filter isTestPath changed
       tamperFlag =
         [ flag "TEST_TAMPERING" "CRITICAL"
@@ -180,11 +216,19 @@ reviewEdit req =
              <> "edit phase (it was deleted before the run, but this is "
              <> "a fabrication attempt signal).")
         | metricsWrote ]
+      fabricationFlag =
+        [ flag "METRIC_FABRICATION" "WARN"
+            ("The edit writes a hardcoded objective value instead of "
+             <> "measuring one: "
+             <> T.intercalate "; " (take 3 literalWrites)
+             <> ". Verify the objective is still computed from a real run.")
+        | not (null literalWrites) ]
       noopFlag =
         [ flag "NO_CHANGES" "INFO"
             "Editor reported completion without modifying any file."
         | null changed ]
-  in object ["flags" .= (tamperFlag <> metricsFlag <> noopFlag)]
+  in object ["flags" .= (tamperFlag <> metricsFlag <> fabricationFlag
+                         <> noopFlag)]
 
 -- ---------------------------------------------------------------------------
 -- review_result — referee rules for the result phase
@@ -224,7 +268,11 @@ reviewResult req =
             ("This trial repeats a change already recorded as a dead end: "
              <> d)
         | Just d <- [deadEnd] ]
-      jump = case (measured, score, best) of
+      -- Suppressed once the goal condition holds: N failing tests -> 0 is
+      -- a 100% "jump" and also the exact outcome the loop exists to
+      -- produce, so flagging it would feed the next judge panel a
+      -- referee concern about success.
+      jump = case (measured && not goalMet, score, best) of
         (True, Just s, Just b) | b /= 0 ->
           let j = if direction == "minimize"
                     then (b - s) / abs b else (s - b) / abs b
@@ -235,5 +283,20 @@ reviewResult req =
                   <> "evaluation artifact.")
              | j > 0.9 ]
         _ -> []
+      -- Improving while running an order of magnitude faster than the
+      -- baseline is fabrication-shaped: the work was removed, not
+      -- optimized. Early stopping and caching do this legitimately, so
+      -- it is WARN, never CRITICAL.
+      collapse = case (getNum "duration_seconds" req,
+                       getNum "baseline_duration_seconds" req) of
+        (Just d, Just b)
+          | isBetter, d > 0, b > 0, b / d >= 10 ->
+              [ flag "RUNTIME_COLLAPSE" "WARN"
+                  ("Run improved the objective while finishing "
+                   <> T.pack (show (round (b / d) :: Integer))
+                   <> "x faster than the baseline — confirm the work is "
+                   <> "still being done and not skipped.") ]
+        _ -> []
   in object
-       ["flags" .= (onCrash <> contradiction <> premature <> repeated <> jump)]
+       ["flags" .= (onCrash <> contradiction <> premature <> repeated
+                    <> jump <> collapse)]

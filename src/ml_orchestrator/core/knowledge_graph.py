@@ -60,10 +60,36 @@ def extract_techniques(summary: str) -> List[str]:
 
 
 class ExperimentKnowledgeGraph:
-    def __init__(self, path: Path) -> None:
+    """Exact experiment facts, injected into every agent prompt.
+
+    ``direction``/``metric_name`` exist because this layer is presented
+    to the agents as ground truth. A graph that hardcodes "lower is
+    better" reports the WORST trial as "best so far" under a maximize
+    objective — and does so in every editor prompt, every judge prompt
+    and every post-rotation memory preamble.
+    """
+
+    def __init__(self, path: Path, direction: str = "minimize",
+                 metric_name: str = "val_loss") -> None:
         self.path = Path(path)
+        self.direction = direction
+        self.metric_name = metric_name
         self._data: Dict[str, Any] = {"facts": [], "trials": {}}
         self._load()
+
+    # -- objective access ----------------------------------------------------
+
+    @staticmethod
+    def _objective(info: Dict[str, Any]) -> Optional[float]:
+        """Read a trial's objective, tolerating both persisted key names.
+
+        Trials are still WRITTEN under 'val_loss' so that graphs from
+        older runs keep loading; reads accept 'score' too.
+        """
+        value = info.get("score")
+        if value is None:
+            value = info.get("val_loss")
+        return value if isinstance(value, (int, float)) else None
 
     # -- persistence -----------------------------------------------------------
 
@@ -145,12 +171,13 @@ class ExperimentKnowledgeGraph:
     def best_trial(self) -> Optional[Tuple[int, Dict[str, Any]]]:
         candidates = [
             (t, info) for t, info in self.trials().items()
-            if info.get("val_loss") is not None
+            if self._objective(info) is not None
             and info.get("outcome") in GOOD_OUTCOMES
         ]
         if not candidates:
             return None
-        return min(candidates, key=lambda x: x[1]["val_loss"])
+        chooser = max if self.direction == "maximize" else min
+        return chooser(candidates, key=lambda x: self._objective(x[1]))
 
     def wins(self) -> List[Dict[str, Any]]:
         return [f for f in self._data["facts"]
@@ -193,7 +220,9 @@ class ExperimentKnowledgeGraph:
         if best:
             t, info = best
             lines.append(
-                f"- Best so far: trial {t}, val_loss={info['val_loss']:.4f}"
+                f"- Best so far: trial {t}, "
+                f"{self.metric_name}={self._objective(info):.4f} "
+                f"({self.direction})"
                 + (f", commit {str(info.get('commit'))[:8]}" if info.get("commit") else "")
             )
 

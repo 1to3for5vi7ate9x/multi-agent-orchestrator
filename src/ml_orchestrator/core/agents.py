@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 STATUS_GOAL_REACHED = "GOAL_REACHED"
 STATUS_IMPROVED = "IMPROVED"
@@ -516,24 +516,52 @@ def heuristic_evaluation(
     )
 
 
-def parse_goal_target(goal: str) -> Optional[float]:
-    """Extract a numeric val-loss target from a natural-language goal.
+# Comparison words -> the operator they mean. Order matters in the regex
+# alternation below: multi-character operators must precede their
+# prefixes ('<=' before '<') or the longer form never matches.
+_OP_WORDS: Dict[str, str] = {
+    "<": "<", "<=": "<=", "under": "<", "below": "<", "less than": "<",
+    ">": ">", ">=": ">=", "above": ">", "over": ">", "at least": ">=",
+}
 
-    Understands phrasings like 'validation loss < 0.25', 'val_loss below
-    0.3', 'val loss under 0.25'. Returns None if no target is found.
+_MIN_OPS = r"<=|<|under|below|less than"
+_ANY_OPS = r"<=|<|>=|>|under|below|above|over|at least|less than"
+_NUM = r"([0-9]*\.?[0-9]+)"
+
+_GOAL_PATTERNS = [
+    rf"val(?:idation)?[\s_]*loss\s*({_MIN_OPS})\s*{_NUM}",
+    rf"\bscore\s*({_ANY_OPS})\s*{_NUM}",
+    rf"\bloss\s*({_MIN_OPS})\s*{_NUM}",
+]
+
+
+def parse_goal_condition(goal: str) -> Optional[Tuple[str, float]]:
+    """Extract ``(operator, target)`` from a natural-language goal.
+
+    Understands 'validation loss < 0.25', 'val_loss below 0.3', 'score
+    >= 0.95', 'score at least 0.9'.
+
+    The operator matters as much as the number: 'score >= 0.9' is a
+    MAXIMIZE goal, and returning only 0.9 (as this function's
+    predecessor did) left the caller comparing with the preset's '<',
+    silently declaring success at the worst possible score. Callers
+    should derive both the direction and the comparison from this pair.
     """
-    patterns = [
-        r"val(?:idation)?[\s_]*loss\s*(?:<=?|under|below|less than)\s*"
-        r"([0-9]*\.?[0-9]+)",
-        r"\bscore\s*(?:<=?|>=?|under|below|above|over|at least|less than)\s*"
-        r"([0-9]*\.?[0-9]+)",
-        r"\bloss\s*(?:<=?|under|below|less than)\s*([0-9]*\.?[0-9]+)",
-    ]
-    for pattern in patterns:
+    for pattern in _GOAL_PATTERNS:
         m = re.search(pattern, goal, re.IGNORECASE)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                continue
+        if not m:
+            continue
+        op = _OP_WORDS.get(m.group(1).lower().strip())
+        if op is None:
+            continue
+        try:
+            return op, float(m.group(2))
+        except ValueError:
+            continue
     return None
+
+
+def parse_goal_target(goal: str) -> Optional[float]:
+    """Numeric target only — kept for callers that don't need the operator."""
+    parsed = parse_goal_condition(goal)
+    return parsed[1] if parsed else None

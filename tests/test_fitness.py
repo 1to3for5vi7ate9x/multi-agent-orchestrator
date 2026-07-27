@@ -8,7 +8,10 @@ from types import SimpleNamespace
 from ml_orchestrator.core.fitness import (
     FitnessExtractor, parse_test_results,
 )
-from ml_orchestrator.core.agents import parse_goal_target, heuristic_evaluation
+from ml_orchestrator.core.agents import (
+    heuristic_evaluation, parse_goal_condition, parse_goal_target,
+)
+from ml_orchestrator.main import PRESETS, resolve_goal_condition
 
 passed = failed = 0
 
@@ -104,6 +107,70 @@ check("score >=", parse_goal_target("achieve score >= 0.95") == 0.95)
 check("plain loss", parse_goal_target("reduce loss below 1.5") == 1.5)
 check("val loss still works",
       parse_goal_target("Achieve validation loss < 0.25") == 0.25)
+
+# The operator is as load-bearing as the number: dropping it let a
+# maximize goal be tested with the preset's '<'.
+check("condition keeps >=",
+      parse_goal_condition("achieve score >= 0.95") == (">=", 0.95))
+check("condition keeps <",
+      parse_goal_condition("validation loss < 0.25") == ("<", 0.25))
+check("condition word: at least",
+      parse_goal_condition("score at least 0.9") == (">=", 0.9))
+check("condition word: above",
+      parse_goal_condition("get score above 0.8") == (">", 0.8))
+check("condition word: under",
+      parse_goal_condition("val loss under .15") == ("<", 0.15))
+check("condition none", parse_goal_condition("make the tests pass") is None)
+
+# ---- goal condition resolution (preset < goal text < flags) ----------------------
+print("== goal condition resolution ==")
+
+class _Args:
+    def __init__(self, goal, direction=None, goal_target=None, goal_op=None):
+        self.goal = goal
+        self.direction = direction
+        self.goal_target = goal_target
+        self.goal_op = goal_op
+
+ML = PRESETS["ml"]
+CODING = PRESETS["coding"]
+
+c = resolve_goal_condition(_Args("Achieve validation loss < 0.25"), ML)
+check("ml default minimize",
+      (c["direction"], c["goal_op"], c["goal_target"]) == ("minimize", "<", 0.25), c)
+
+# 2b: a maximize goal written in plain English, no flags at all.
+c = resolve_goal_condition(_Args("Achieve score >= 0.9"), ML)
+check("goal text flips to maximize",
+      (c["direction"], c["goal_op"], c["goal_target"]) == ("maximize", ">=", 0.9), c)
+
+# 2: --direction maximize must flip the comparison, not just the ordering.
+c = resolve_goal_condition(_Args("hit the target", direction="maximize",
+                                 goal_target=0.9), ML)
+check("--direction maximize flips op",
+      (c["direction"], c["goal_op"], c["goal_target"]) == ("maximize", ">", 0.9), c)
+
+c = resolve_goal_condition(_Args("make the suite pass", direction="maximize"),
+                           CODING)
+check("coding <= flips to >=",
+      (c["direction"], c["goal_op"]) == ("maximize", ">="), c)
+
+c = resolve_goal_condition(_Args("make the whole test suite pass"), CODING)
+check("coding default",
+      (c["direction"], c["goal_op"], c["goal_target"]) == ("minimize", "<=", 0.0), c)
+
+c = resolve_goal_condition(_Args("score >= 0.9", goal_op="<", goal_target=0.2),
+                           ML)
+check("explicit flags win",
+      (c["goal_op"], c["goal_target"]) == ("<", 0.2), c)
+
+# The resolved condition must be what actually judges the run.
+c = resolve_goal_condition(_Args("Achieve score >= 0.9"), ML)
+fx = FitnessExtractor(Path("/nonexistent/metrics.json"),
+                      direction=c["direction"], goal_op=c["goal_op"])
+check("resolved condition drives goal_met",
+      fx.goal_met(0.95, c["goal_target"])
+      and not fx.goal_met(0.85, c["goal_target"]))
 
 # ---- heuristic with direction/op --------------------------------------------------
 print("== heuristic direction-aware ==")

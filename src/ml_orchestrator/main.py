@@ -42,9 +42,10 @@ from .core import (
 )
 from .core import CodeGraph, ExperimentKnowledgeGraph, format_changes
 from .core import AskAgent, Referee, resolve_roster, run_tournament
-from .core.agents import heuristic_evaluation, parse_goal_target
+from .core.agents import heuristic_evaluation, parse_goal_condition
 from .core.live_status import LiveStatus
 from .core.referee import CRITICAL as FLAG_CRITICAL
+from .core.referee import find_literal_metric_writes
 from .core.git_manager import DEFAULT_IGNORES
 from .core.runner import ExecutionHarness as Harness  # alias for clarity
 from .core.session import (
@@ -193,6 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Explicit numeric goal target for the score "
                         "(default: parsed from --goal, or the preset's "
                         "default).")
+    p.add_argument("--goal-op", choices=["<", "<=", ">", ">="], default=None,
+                   help="Comparison used to test the goal, e.g. '>=' for "
+                        "'score >= 0.9'. Default: derived from --goal's "
+                        "wording, then --direction, then --preset.")
     p.add_argument("--scaffold-demo", action="store_true",
                    help="Copy the bundled demo train.py/model_example.py "
                         "into --workdir before starting (self-contained "
@@ -299,6 +304,51 @@ def build_eval_command(args, preset: Dict[str, Any], workdir: Path,
             return shell + ["npm test --silent"]
         return None
     return [python_bin, args.train_script]
+
+
+def _flip_op(op: str, direction: str) -> str:
+    """Point a comparison at *direction*, preserving strictness."""
+    to_max = {"<": ">", "<=": ">=", ">": ">", ">=": ">="}
+    to_min = {">": "<", ">=": "<=", "<": "<", "<=": "<="}
+    return (to_max if direction == "maximize" else to_min).get(op, op)
+
+
+def resolve_goal_condition(args, preset: Dict[str, Any]) -> Dict[str, Any]:
+    """Decide direction, comparison operator and numeric target.
+
+    One place owns the comparison, three inputs feed it, in increasing
+    precedence: the preset, the goal text, then explicit flags. This is
+    deliberately centralized — the previous split (direction from a
+    flag, operator from the preset, target from the text) let them
+    disagree, so 'score >= 0.9' or '--direction maximize' would report
+    GOAL_REACHED at the score furthest from the target.
+    """
+    direction = preset["direction"]
+    goal_op = preset["goal_op"]
+    target = preset["default_goal_target"]
+    source = "preset"
+
+    parsed = parse_goal_condition(args.goal)
+    if parsed is not None:
+        parsed_op, parsed_target = parsed
+        target = parsed_target
+        goal_op = parsed_op
+        direction = "maximize" if parsed_op in (">", ">=") else "minimize"
+        source = "goal text"
+
+    if args.goal_target is not None:
+        target = args.goal_target
+        source = "--goal-target"
+    if args.direction is not None and args.direction != direction:
+        direction = args.direction
+        goal_op = _flip_op(goal_op, direction)
+        source = "--direction"
+    if args.goal_op is not None:
+        goal_op = args.goal_op
+        source = "--goal-op"
+
+    return {"direction": direction, "goal_op": goal_op,
+            "goal_target": target, "source": source}
 
 
 def read_metrics(path: Path) -> Optional[Dict[str, Any]]:
@@ -449,7 +499,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     workdir = Path(args.workdir).resolve()
     preset = PRESETS[args.preset]
-    direction = args.direction or preset["direction"]
+    condition = resolve_goal_condition(args, preset)
+    direction = condition["direction"]
+    goal_op = condition["goal_op"]
+    goal_target = condition["goal_target"]
     metric_name = preset["metric_name"]
 
     banner("ml-agent-orchestrator\n"
@@ -547,7 +600,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     memory_dir = workdir / args.memory_dir
     memory_dir.mkdir(parents=True, exist_ok=True)
     code_graph_path = memory_dir / "code_graph.json"
-    kg = ExperimentKnowledgeGraph(memory_dir / "knowledge_graph.json")
+    kg = ExperimentKnowledgeGraph(memory_dir / "knowledge_graph.json",
+                                  direction=direction,
+                                  metric_name=metric_name)
     graph_state = {"current": CodeGraph.build(workdir)}
     graph_state["current"].save(code_graph_path)
     info(f"Code graph: {len(graph_state['current'].modules)} module(s) "
@@ -677,7 +732,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     fitness = FitnessExtractor(
         metrics_path=metrics_path,
         direction=direction,
-        goal_op=preset["goal_op"],
+        goal_op=goal_op,
         allow_exit_code_score=preset["allow_exit_code_score"],
     )
     logger = ExperimentLogger(workdir / "experiments_history.json")
@@ -695,14 +750,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     })
     info(f"Session {session_id} started; history -> experiments_history.json")
 
-    goal_target = args.goal_target
-    if goal_target is None:
-        goal_target = parse_goal_target(args.goal)
-    if goal_target is None:
-        goal_target = preset["default_goal_target"]
     if goal_target is not None:
-        info(f"Numeric goal condition: {metric_name} "
-             f"{preset['goal_op']} {goal_target}")
+        info(f"Numeric goal condition: {metric_name} {goal_op} "
+             f"{goal_target} ({direction}; from {condition['source']})")
+    else:
+        info(f"No numeric goal condition ({direction}); the evaluator "
+             "decides when the goal is met.")
 
     best_metrics: Optional[Dict[str, Any]] = None
     best_score: Optional[float] = None
@@ -710,6 +763,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     stagnation = 0  # consecutive trials without a commit (rotation trigger)
     consecutive_noop = 0     # NO_CHANGES/EDITOR_FAILED streak (stall exit)
     tournament_cooldown = 0  # trials to skip tournaments after an abort
+    stagnation_threshold = 2  # doubles after each tournament (backoff)
+    facts_at_last_tournament = -1  # knowledge-graph size when last held
+    baseline_duration: Optional[float] = None
     pending_feedback = ""
     pending_diagnostic = ""
     final_result = "MAX_TRIALS_EXHAUSTED"
@@ -723,6 +779,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if fit.measured:
             best_metrics = fit.metrics
             best_score = fit.score
+            baseline_duration = result.duration_seconds
             success(f"Baseline established: {metric_name}={fit.score:.4f} "
                     f"[{fit.detail}] ({result.duration_seconds:.1f}s)")
             logger.record_trial(
@@ -754,439 +811,479 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
 
     # ---- Main closed loop ---------------------------------------------------
-    for trial in range(1, args.max_trials + 1):
-        phase(f"Trial {trial}/{args.max_trials}")
+    # Ctrl-C is a first-class outcome for a tool that runs for hours:
+    # finish the session honestly, keep the report, and leave the
+    # working tree ALONE. Interrupting is usually deliberate ('that
+    # edit looks right'), so auto-reverting would destroy work at the
+    # one moment the user is watching.
+    interrupted = False
+    try:
+        for trial in range(1, args.max_trials + 1):
+            phase(f"Trial {trial}/{args.max_trials}")
 
-        # -- -2. Stall exit: repeated no-op trials mean the loop is blocked
-        # by something no edit can fix (bad eval env, impossible goal).
-        if consecutive_noop >= 3:
-            error("Three consecutive trials produced no edits — the loop "
-                  "is blocked by something outside the code (check the "
-                  "evaluation command / environment). Stopping early.")
-            final_result = "STALLED"
-            break
+            # -- -2. Stall exit: repeated no-op trials mean the loop is blocked
+            # by something no edit can fix (bad eval env, impossible goal).
+            if consecutive_noop >= 3:
+                error("Three consecutive trials produced no edits — the loop "
+                      "is blocked by something outside the code (check the "
+                      "evaluation command / environment). Stopping early.")
+                final_result = "STALLED"
+                break
 
-        # -- -1. Blind tournament: reassign seats when due -------------------
-        if tournament_cooldown > 0:
-            tournament_cooldown -= 1
-        elif rotate and len(ask_agents()) >= 2 and (
-            trial == 1
-            or stagnation >= 2
-            or (args.tournament_every > 0 and trial > 1
-                and (trial - 1) % args.tournament_every == 0)
-        ):
-            info("Tournament: collecting anonymous proposals from "
-                 f"{', '.join(roster)}; panel judging follows...")
-            t_result = run_tournament(
-                agents=ask_agents(),
-                goal=args.goal,
-                trial=trial,
-                knowledge_context=knowledge_context(),
-                history_summary=logger.history_summary(),
-                last_feedback=pending_feedback,
-                mode=args.preset,
-                referee_notes="\n".join(
-                    f"- [{f['severity']}] {f['code']}: {f['detail']}"
-                    for f in recent_flags[-8:]),
-                incumbent=seat_editor,
-                log=info,
-                status_factory=LiveStatus,
+            # -- -1. Blind tournament: reassign seats when due -------------------
+            #
+            # Stagnation re-runs are gated on the knowledge graph having
+            # GAINED facts since the last tournament, and the threshold
+            # backs off (2 -> 4 -> 8) each time one is held. Rotating the
+            # driver when stuck is the point; re-proposing from an
+            # unchanged context is not — with no new facts the panel can
+            # only re-rank the same speculation at 2N CLI calls a round.
+            facts_now = len(kg.facts)
+            due_to_stagnation = (
+                stagnation >= stagnation_threshold
+                and facts_now > facts_at_last_tournament
             )
-            if t_result is None:
-                warn("Tournament inconclusive (not enough proposals or "
-                     "scores); keeping current seats and pausing "
-                     "tournaments for 2 trials.")
-                logger.record_event("TOURNAMENT_ABORTED", {"trial": trial})
-                tournament_cooldown = 2
-            else:
-                seat_editor = t_result.winner
-                seat_evaluator = (t_result.evaluator
-                                  if t_result.evaluator != t_result.winner
-                                  else seat_evaluator)
-                for agent_name, mean_score in t_result.ranking:
-                    info(f"  panel score — {agent_name}: {mean_score:.2f}")
-                success(f"Seats assigned — editor: {seat_editor}, "
-                        f"evaluator: {seat_evaluator or 'heuristic'}")
-                logger.record_event("TOURNAMENT",
-                                    {"trial": trial, **t_result.to_dict()})
-                pending_feedback = (
-                    "## Your winning tournament proposal — implement "
-                    "exactly this\n" + t_result.winning_proposal
-                    + (("\n\n" + pending_feedback) if pending_feedback
-                       else "")
+            if tournament_cooldown > 0:
+                tournament_cooldown -= 1
+            elif (stagnation >= stagnation_threshold
+                  and facts_now <= facts_at_last_tournament):
+                info(f"Stagnation at {stagnation} trials, but the knowledge "
+                     "graph has no new facts since the last tournament — "
+                     "keeping current seats rather than re-ranking the same "
+                     "context.")
+            elif rotate and len(ask_agents()) >= 2 and (
+                trial == 1
+                or due_to_stagnation
+                or (args.tournament_every > 0 and trial > 1
+                    and (trial - 1) % args.tournament_every == 0)
+            ):
+                info("Tournament: collecting anonymous proposals from "
+                     f"{', '.join(roster)}; panel judging follows...")
+                t_result = run_tournament(
+                    agents=ask_agents(),
+                    goal=args.goal,
+                    trial=trial,
+                    knowledge_context=knowledge_context(),
+                    history_summary=logger.history_summary(),
+                    last_feedback=pending_feedback,
+                    mode=args.preset,
+                    referee_notes="\n".join(
+                        f"- [{f['severity']}] {f['code']}: {f['detail']}"
+                        for f in recent_flags[-8:]),
+                    incumbent=seat_editor,
+                    log=info,
+                    status_factory=LiveStatus,
                 )
-                stagnation = 0
-
-        # -- 0. Context-budget checkpoint: rotate degraded sessions ----------
-        for name, sess in list(live_sessions.items()):
-            if sess is None:
-                continue
-            if sess.should_rotate():
-                warn(f"{name} session at {sess.context_fraction():.0%} of "
-                     "context — closing it with a memory handoff...")
-                try:
-                    snapshot = sess.rotate(
-                        reason=f"context threshold before trial {trial}"
+                if t_result is None:
+                    warn("Tournament inconclusive (not enough proposals or "
+                         "scores); keeping current seats and pausing "
+                         "tournaments for 2 trials.")
+                    logger.record_event("TOURNAMENT_ABORTED", {"trial": trial})
+                    tournament_cooldown = 2
+                else:
+                    seat_editor = t_result.winner
+                    seat_evaluator = (t_result.evaluator
+                                      if t_result.evaluator != t_result.winner
+                                      else seat_evaluator)
+                    for agent_name, mean_score in t_result.ranking:
+                        info(f"  panel score — {agent_name}: {mean_score:.2f}")
+                    success(f"Seats assigned — editor: {seat_editor}, "
+                            f"evaluator: {seat_evaluator or 'heuristic'}")
+                    logger.record_event("TOURNAMENT",
+                                        {"trial": trial, **t_result.to_dict()})
+                    pending_feedback = (
+                        "## Your winning tournament proposal — implement "
+                        "exactly this\n" + t_result.winning_proposal
+                        + (("\n\n" + pending_feedback) if pending_feedback
+                           else "")
                     )
-                    logger.record_event("SESSION_ROTATED", {
-                        "agent": name,
-                        "trial": trial,
-                        "snapshot_saved": bool(snapshot),
-                    })
-                    success(f"{name} session rotated; the next call opens a "
-                            "fresh session seeded with the memory snapshot.")
-                except AgentError as exc:
-                    warn(f"Rotation of {name} session failed ({exc}); "
-                         "continuing with a fresh session anyway.")
-            info(f"Context [{sess.status_line()}]")
+                    stagnation = 0
+                    facts_at_last_tournament = facts_now
+                    if trial > 1:
+                        stagnation_threshold = min(stagnation_threshold * 2, 8)
 
-        # -- 1. Editor modifies the code ------------------------------------
-        info(f"Editor ({seat_editor}): requesting code modification...")
-        editor = editor_for(seat_editor)
-
-        def _metrics_sig() -> Optional[str]:
-            try:
-                return hashlib.sha1(metrics_path.read_bytes()).hexdigest()
-            except OSError:
-                return None
-        pre_edit_metrics_sig = _metrics_sig()
-        pre_edit_untracked = set(git.untracked_files())
-
-        def remove_editor_debris() -> None:
-            """Delete untracked files the editor created this trial.
-
-            `git checkout -- .` only restores tracked files; an editor's
-            new untracked files would otherwise survive the revert and
-            pollute every later trial's diff (a leftover tests/conftest.py
-            caused a false TEST_TAMPERING block in the dogfood run).
-            """
-            debris = set(git.untracked_files()) - pre_edit_untracked
-            for rel in sorted(debris):
-                target = (workdir / rel).resolve()
-                if not str(target).startswith(str(workdir)):
+            # -- 0. Context-budget checkpoint: rotate degraded sessions ----------
+            for name, sess in list(live_sessions.items()):
+                if sess is None:
                     continue
+                if sess.should_rotate():
+                    warn(f"{name} session at {sess.context_fraction():.0%} of "
+                         "context — closing it with a memory handoff...")
+                    try:
+                        snapshot = sess.rotate(
+                            reason=f"context threshold before trial {trial}"
+                        )
+                        logger.record_event("SESSION_ROTATED", {
+                            "agent": name,
+                            "trial": trial,
+                            "snapshot_saved": bool(snapshot),
+                        })
+                        success(f"{name} session rotated; the next call opens a "
+                                "fresh session seeded with the memory snapshot.")
+                    except AgentError as exc:
+                        warn(f"Rotation of {name} session failed ({exc}); "
+                             "continuing with a fresh session anyway.")
+                info(f"Context [{sess.status_line()}]")
+
+            # -- 1. Editor modifies the code ------------------------------------
+            info(f"Editor ({seat_editor}): requesting code modification...")
+            editor = editor_for(seat_editor)
+
+            def _metrics_sig() -> Optional[str]:
                 try:
-                    target.unlink()
-                    info(f"Removed editor debris: {rel}")
-                except OSError as exc:
-                    warn(f"Could not remove editor debris {rel}: {exc}")
+                    return hashlib.sha1(metrics_path.read_bytes()).hexdigest()
+                except OSError:
+                    return None
+            pre_edit_metrics_sig = _metrics_sig()
+            pre_edit_untracked = set(git.untracked_files())
 
-        try:
-            editor_summary = editor.request_edit(
-                goal=args.goal,
-                trial=trial,
-                train_script=args.train_script,
-                editable_files=editable,
-                feedback=pending_feedback,
-                diagnostic=pending_diagnostic,
-                history_summary=logger.history_summary(),
-                knowledge_context=knowledge_context(),
-                mode=args.preset,
-                eval_command=eval_command_display,
-            )
-            info(f"Editor summary: {editor_summary[:400]}")
-        except AgentError as exc:
-            error(f"Editor invocation failed: {exc}")
-            logger.record_trial(
-                trial=trial, commit=git.head_commit(),
-                status="EDITOR_FAILED", action="SKIPPED", metrics=None,
-                evaluation=None, error_type="EDITOR_FAILURE",
-                editor_agent=seat_editor, evaluator_agent=seat_evaluator,
-            )
-            pending_diagnostic = ""
-            pending_feedback = (
-                "The previous editor invocation failed at the CLI level; "
-                "no code was changed."
-            )
-            stagnation += 1
-            consecutive_noop += 1
-            continue
+            def remove_editor_debris() -> None:
+                """Delete untracked files the editor created this trial.
 
-        if not git.is_dirty():
-            warn("Editor reported completion but made no file changes; "
-                 "recording and moving on.")
-            logger.record_trial(
-                trial=trial, commit=git.head_commit(), status="NO_CHANGES",
-                action="SKIPPED", metrics=None, evaluation=None,
-                editor_summary=editor_summary,
-            )
-            kg.record_trial(
-                trial=trial, outcome="NO_CHANGES", action="SKIPPED",
-                val_loss=None, commit=None, editor_summary=editor_summary,
-            )
-            stagnation += 1
-            consecutive_noop += 1
-            pending_feedback = (
-                "Your previous turn produced NO file modifications. You must "
-                "actually edit the source files, not just describe changes."
-            )
-            pending_diagnostic = ""
-            continue
-        changed_files = git.changed_files()
-        info(f"Modified files: {', '.join(changed_files)}")
-        consecutive_noop = 0  # the editor is acting; not a stalled loop
+                `git checkout -- .` only restores tracked files; an editor's
+                new untracked files would otherwise survive the revert and
+                pollute every later trial's diff (a leftover tests/conftest.py
+                caused a false TEST_TAMPERING block in the dogfood run).
+                """
+                debris = set(git.untracked_files()) - pre_edit_untracked
+                for rel in sorted(debris):
+                    target = (workdir / rel).resolve()
+                    if not str(target).startswith(str(workdir)):
+                        continue
+                    try:
+                        target.unlink()
+                        info(f"Removed editor debris: {rel}")
+                    except OSError as exc:
+                        warn(f"Could not remove editor debris {rel}: {exc}")
 
-        # -- 1.5 AST diff: what exactly changed this trial --------------------
-        new_graph = CodeGraph.build(workdir)
-        const_changes = graph_state["current"].constants_diff(new_graph)
-        func_changes = graph_state["current"].changed_functions(new_graph)
-        change_text = format_changes(const_changes, func_changes)
-        if change_text:
-            for line in change_text.splitlines():
-                info(line)
-        graph_state["current"] = new_graph
-        new_graph.save(code_graph_path)
-
-        # -- 1.6 Referee: edit-phase rules ------------------------------------
-        edit_flags = ref.check_edit_phase(
-            changed_files,
-            metrics_file_written_during_edit=(
-                _metrics_sig() != pre_edit_metrics_sig),
-        )
-        for f in edit_flags:
-            (error if f.severity == FLAG_CRITICAL else warn)(
-                f"REFEREE [{f.severity}] {f.code}: {f.detail}")
-        recent_flags = (recent_flags
-                        + [f.to_dict() for f in edit_flags])[-12:]
-        if any(f.severity == FLAG_CRITICAL for f in edit_flags):
-            git.discard_changes()
-            remove_editor_debris()
-            warn("Referee force-reverted the edit; no run performed.")
-            logger.record_trial(
-                trial=trial, commit=None, status="REFEREE_BLOCKED",
-                action="REVERTED", metrics=None, evaluation=None,
-                editor_summary=editor_summary,
-                referee_flags=[f.to_dict() for f in edit_flags],
-                editor_agent=seat_editor, evaluator_agent=seat_evaluator,
-            )
-            kg.record_trial(
-                trial=trial, outcome="REFEREE_BLOCKED", action="REVERTED",
-                val_loss=None, commit=None, const_changes=const_changes,
-                func_changes=func_changes, editor_summary=editor_summary,
-            )
-            logger.record_event("REFEREE_BLOCK", {
-                "trial": trial, "editor": seat_editor,
-                "flags": [f.to_dict() for f in edit_flags],
-            })
-            graph_state["current"] = CodeGraph.build(workdir)
-            graph_state["current"].save(code_graph_path)
-            pending_feedback = (
-                "THE REFEREE BLOCKED your previous edit and it was "
-                "reverted:\n" + Referee.render(edit_flags)
-                + "\nFix the SOURCE code — never the tests or the "
-                "measurement."
-            )
-            pending_diagnostic = ""
-            stagnation += 1
-            continue
-
-        # -- 2. Sandboxed evaluation run ---------------------------------------
-        info(f"Runner: executing '{eval_command_display}' "
-             f"(timeout {args.timeout:.0f}s)...")
-        result, fit = run_evaluation(
-            harness, eval_command, metrics_path, args.timeout, fitness,
-        )
-        metrics = fit.metrics
-        crashed = not fit.measured
-        crash_diagnostic = ""
-        if crashed:
-            if result.crashed:
-                crash_diagnostic = Harness.build_diagnostic_prompt(result)
-                error(f"Run failed after {result.duration_seconds:.1f}s "
-                      f"(error class: {result.error_type}).")
-            else:
-                crash_diagnostic = (
-                    "## Objective contract violation\nThe process exited 0 "
-                    "but produced no measurable objective: no "
-                    f"'{args.metrics_file}' with a numeric score/val_loss, "
-                    "and no recognizable test-runner summary in the output."
+            try:
+                editor_summary = editor.request_edit(
+                    goal=args.goal,
+                    trial=trial,
+                    train_script=args.train_script,
+                    editable_files=editable,
+                    feedback=pending_feedback,
+                    diagnostic=pending_diagnostic,
+                    history_summary=logger.history_summary(),
+                    knowledge_context=knowledge_context(),
+                    mode=args.preset,
+                    eval_command=eval_command_display,
                 )
-                warn("Run exited cleanly but produced no measurable "
-                     "objective.")
-        else:
-            note = "" if result.succeeded else \
-                " (non-zero exit treated as a measurement, not a crash)"
-            success(f"Run completed in {result.duration_seconds:.1f}s: "
-                    f"{metric_name}={fit.score:.4f} [{fit.detail}]{note}")
+                info(f"Editor summary: {editor_summary[:400]}")
+            except AgentError as exc:
+                error(f"Editor invocation failed: {exc}")
+                logger.record_trial(
+                    trial=trial, commit=git.head_commit(),
+                    status="EDITOR_FAILED", action="SKIPPED", metrics=None,
+                    evaluation=None, error_type="EDITOR_FAILURE",
+                    editor_agent=seat_editor, evaluator_agent=seat_evaluator,
+                )
+                pending_diagnostic = ""
+                pending_feedback = (
+                    "The previous editor invocation failed at the CLI level; "
+                    "no code was changed."
+                )
+                stagnation += 1
+                consecutive_noop += 1
+                continue
 
-        # -- 3. Evaluator verdict ---------------------------------------------
-        info(f"Evaluator ({seat_evaluator or 'numeric heuristic'}): "
-             "analyzing metrics and dynamics...")
-        try:
-            active_evaluator = evaluator_for(seat_evaluator)
-        except Exception:
-            active_evaluator = None
-        evaluation = evaluate_run(
-            evaluator=active_evaluator,
-            goal=args.goal,
-            goal_target=goal_target,
-            trial=trial,
-            metrics=metrics,
-            best_metrics=best_metrics,
-            history_summary=logger.history_summary(),
-            log_tail=result.tail(3000),
-            crash_diagnostic=crash_diagnostic,
-            crashed=crashed,
-            error_type=result.error_type,
-            change_summary=change_text,
-            knowledge_context=kg.render_context(),
-            mode=args.preset,
-            eval_command_display=eval_command_display,
-            score=fit.score,
-            best_score=best_score,
-            direction=direction,
-            goal_op=preset["goal_op"],
-            evaluator_name=seat_evaluator or "",
-        )
-        info(f"Verdict: {evaluation.status} (via {evaluation.source})")
-        info(f"Reasoning: {evaluation.reasoning[:300]}")
+            if not git.is_dirty():
+                warn("Editor reported completion but made no file changes; "
+                     "recording and moving on.")
+                logger.record_trial(
+                    trial=trial, commit=git.head_commit(), status="NO_CHANGES",
+                    action="SKIPPED", metrics=None, evaluation=None,
+                    editor_summary=editor_summary,
+                    editor_agent=seat_editor, evaluator_agent=seat_evaluator,
+                )
+                kg.record_trial(
+                    trial=trial, outcome="NO_CHANGES", action="SKIPPED",
+                    val_loss=None, commit=None, editor_summary=editor_summary,
+                )
+                stagnation += 1
+                consecutive_noop += 1
+                pending_feedback = (
+                    "Your previous turn produced NO file modifications. You must "
+                    "actually edit the source files, not just describe changes."
+                )
+                pending_diagnostic = ""
+                continue
+            changed_files = git.changed_files()
+            info(f"Modified files: {', '.join(changed_files)}")
+            consecutive_noop = 0  # the editor is acting; not a stalled loop
 
-        # -- 3.5 Referee: result-phase rules + verdict arbitration -------------
-        result_flags = ref.check_result_phase(
-            evaluation_status=evaluation.status,
-            measured=fit.measured,
-            score=fit.score,
-            best_score=best_score,
-            goal_met=fitness.goal_met(fit.score, goal_target),
-            is_better=fitness.is_better(fit.score, best_score),
-            repeated_dead_end=Referee.find_repeated_dead_end(
-                kg, const_changes),
-        )
-        for f in result_flags:
-            (error if f.severity == FLAG_CRITICAL else warn)(
-                f"REFEREE [{f.severity}] {f.code}: {f.detail}")
-        codes = {f.code for f in result_flags}
-        if "VERDICT_ON_CRASH" in codes:
-            evaluation.status = STATUS_CRASHED
-        elif "VERDICT_CONTRADICTION" in codes:
-            warn("Referee override: verdict downgraded to REGRESSED "
-                 "(numeric ground truth wins).")
-            evaluation.status = STATUS_REGRESSED
-        elif "PREMATURE_GOAL" in codes:
-            downgraded = STATUS_IMPROVED if fitness.is_better(
-                fit.score, best_score) else STATUS_REGRESSED
-            warn(f"Referee override: GOAL_REACHED downgraded to "
-                 f"{downgraded} (goal condition not met numerically).")
-            evaluation.status = downgraded
-        all_flags = edit_flags + result_flags
-        trial_flag_dicts = [f.to_dict() for f in all_flags]
-        recent_flags = (recent_flags
-                        + [f.to_dict() for f in result_flags])[-12:]
-        if result_flags:
-            logger.record_event("REFEREE_FLAGS", {
-                "trial": trial,
-                "flags": [f.to_dict() for f in result_flags],
-            })
+            # -- 1.5 AST diff: what exactly changed this trial --------------------
+            new_graph = CodeGraph.build(workdir)
+            const_changes = graph_state["current"].constants_diff(new_graph)
+            func_changes = graph_state["current"].changed_functions(new_graph)
+            change_text = format_changes(const_changes, func_changes)
+            if change_text:
+                for line in change_text.splitlines():
+                    info(line)
+            graph_state["current"] = new_graph
+            new_graph.save(code_graph_path)
 
-        # -- 4. Git state decision ---------------------------------------------
-        if evaluation.status == STATUS_GOAL_REACHED:
-            commit = git.commit_trial(
-                trial, fit.score,
-                note=f"GOAL REACHED — {args.goal}",
-                metric_name=metric_name,
+            # -- 1.6 Referee: edit-phase rules ------------------------------------
+            edit_flags = ref.check_edit_phase(
+                changed_files,
+                metrics_file_written_during_edit=(
+                    _metrics_sig() != pre_edit_metrics_sig),
+                literal_metric_writes=find_literal_metric_writes(
+                    workdir, changed_files),
             )
-            success(f"GOAL REACHED — committed {git.short(commit)}.")
+            for f in edit_flags:
+                (error if f.severity == FLAG_CRITICAL else warn)(
+                    f"REFEREE [{f.severity}] {f.code}: {f.detail}")
+            recent_flags = (recent_flags
+                            + [f.to_dict() for f in edit_flags])[-12:]
+            if any(f.severity == FLAG_CRITICAL for f in edit_flags):
+                git.discard_changes()
+                remove_editor_debris()
+                warn("Referee force-reverted the edit; no run performed.")
+                logger.record_trial(
+                    trial=trial, commit=None, status="REFEREE_BLOCKED",
+                    action="REVERTED", metrics=None, evaluation=None,
+                    editor_summary=editor_summary,
+                    referee_flags=[f.to_dict() for f in edit_flags],
+                    editor_agent=seat_editor, evaluator_agent=seat_evaluator,
+                )
+                kg.record_trial(
+                    trial=trial, outcome="REFEREE_BLOCKED", action="REVERTED",
+                    val_loss=None, commit=None, const_changes=const_changes,
+                    func_changes=func_changes, editor_summary=editor_summary,
+                )
+                logger.record_event("REFEREE_BLOCK", {
+                    "trial": trial, "editor": seat_editor,
+                    "flags": [f.to_dict() for f in edit_flags],
+                })
+                graph_state["current"] = CodeGraph.build(workdir)
+                graph_state["current"].save(code_graph_path)
+                pending_feedback = (
+                    "THE REFEREE BLOCKED your previous edit and it was "
+                    "reverted:\n" + Referee.render(edit_flags)
+                    + "\nFix the SOURCE code — never the tests or the "
+                    "measurement."
+                )
+                pending_diagnostic = ""
+                stagnation += 1
+                continue
+
+            # -- 2. Sandboxed evaluation run ---------------------------------------
+            info(f"Runner: executing '{eval_command_display}' "
+                 f"(timeout {args.timeout:.0f}s)...")
+            result, fit = run_evaluation(
+                harness, eval_command, metrics_path, args.timeout, fitness,
+            )
+            metrics = fit.metrics
+            crashed = not fit.measured
+            crash_diagnostic = ""
+            if crashed:
+                if result.crashed:
+                    crash_diagnostic = Harness.build_diagnostic_prompt(result)
+                    error(f"Run failed after {result.duration_seconds:.1f}s "
+                          f"(error class: {result.error_type}).")
+                else:
+                    crash_diagnostic = (
+                        "## Objective contract violation\nThe process exited 0 "
+                        "but produced no measurable objective: no "
+                        f"'{args.metrics_file}' with a numeric score/val_loss, "
+                        "and no recognizable test-runner summary in the output."
+                    )
+                    warn("Run exited cleanly but produced no measurable "
+                         "objective.")
+            else:
+                note = "" if result.succeeded else \
+                    " (non-zero exit treated as a measurement, not a crash)"
+                success(f"Run completed in {result.duration_seconds:.1f}s: "
+                        f"{metric_name}={fit.score:.4f} [{fit.detail}]{note}")
+
+            # -- 3. Evaluator verdict ---------------------------------------------
+            info(f"Evaluator ({seat_evaluator or 'numeric heuristic'}): "
+                 "analyzing metrics and dynamics...")
+            try:
+                active_evaluator = evaluator_for(seat_evaluator)
+            except Exception:
+                active_evaluator = None
+            evaluation = evaluate_run(
+                evaluator=active_evaluator,
+                goal=args.goal,
+                goal_target=goal_target,
+                trial=trial,
+                metrics=metrics,
+                best_metrics=best_metrics,
+                history_summary=logger.history_summary(),
+                log_tail=result.tail(3000),
+                crash_diagnostic=crash_diagnostic,
+                crashed=crashed,
+                error_type=result.error_type,
+                change_summary=change_text,
+                knowledge_context=kg.render_context(),
+                mode=args.preset,
+                eval_command_display=eval_command_display,
+                score=fit.score,
+                best_score=best_score,
+                direction=direction,
+                goal_op=goal_op,
+                evaluator_name=seat_evaluator or "",
+            )
+            info(f"Verdict: {evaluation.status} (via {evaluation.source})")
+            info(f"Reasoning: {evaluation.reasoning[:300]}")
+
+            # -- 3.5 Referee: result-phase rules + verdict arbitration -------------
+            result_flags = ref.check_result_phase(
+                evaluation_status=evaluation.status,
+                measured=fit.measured,
+                score=fit.score,
+                best_score=best_score,
+                goal_met=fitness.goal_met(fit.score, goal_target),
+                is_better=fitness.is_better(fit.score, best_score),
+                repeated_dead_end=Referee.find_repeated_dead_end(
+                    kg, const_changes),
+                duration_seconds=result.duration_seconds,
+                baseline_duration_seconds=baseline_duration,
+            )
+            for f in result_flags:
+                (error if f.severity == FLAG_CRITICAL else warn)(
+                    f"REFEREE [{f.severity}] {f.code}: {f.detail}")
+            codes = {f.code for f in result_flags}
+            if "VERDICT_ON_CRASH" in codes:
+                evaluation.status = STATUS_CRASHED
+            elif "VERDICT_CONTRADICTION" in codes:
+                warn("Referee override: verdict downgraded to REGRESSED "
+                     "(numeric ground truth wins).")
+                evaluation.status = STATUS_REGRESSED
+            elif "PREMATURE_GOAL" in codes:
+                downgraded = STATUS_IMPROVED if fitness.is_better(
+                    fit.score, best_score) else STATUS_REGRESSED
+                warn(f"Referee override: GOAL_REACHED downgraded to "
+                     f"{downgraded} (goal condition not met numerically).")
+                evaluation.status = downgraded
+            all_flags = edit_flags + result_flags
+            trial_flag_dicts = [f.to_dict() for f in all_flags]
+            recent_flags = (recent_flags
+                            + [f.to_dict() for f in result_flags])[-12:]
+            if result_flags:
+                logger.record_event("REFEREE_FLAGS", {
+                    "trial": trial,
+                    "flags": [f.to_dict() for f in result_flags],
+                })
+
+            # -- 4. Git state decision ---------------------------------------------
+            if evaluation.status == STATUS_GOAL_REACHED:
+                commit = git.commit_trial(
+                    trial, fit.score,
+                    note=f"GOAL REACHED — {args.goal}",
+                    metric_name=metric_name,
+                )
+                success(f"GOAL REACHED — committed {git.short(commit)}.")
+                logger.record_trial(
+                    trial=trial, commit=commit, status=evaluation.status,
+                    action="GOAL_COMMIT", metrics=metrics,
+                    evaluation=evaluation.to_dict(),
+                    editor_summary=editor_summary,
+                    runtime_seconds=result.duration_seconds, score=fit.score,
+                    referee_flags=trial_flag_dicts,
+                    editor_agent=seat_editor, evaluator_agent=seat_evaluator,
+                )
+                kg.record_trial(
+                    trial=trial, outcome=evaluation.status, action="GOAL_COMMIT",
+                    val_loss=fit.score, commit=commit,
+                    const_changes=const_changes, func_changes=func_changes,
+                    editor_summary=editor_summary,
+                    evaluator_reasoning=evaluation.reasoning,
+                )
+                final_result = "GOAL_REACHED"
+                break
+
+            if evaluation.status == STATUS_IMPROVED and not crashed:
+                commit = git.commit_trial(trial, fit.score,
+                                          metric_name=metric_name)
+                best_metrics = metrics
+                best_score = fit.score
+                best_commit = commit
+                success(f"Improvement committed as {git.short(commit)} "
+                        f"(experiment(trial-{trial}): "
+                        f"{metric_name}={fit.score:.4f}).")
+                logger.record_trial(
+                    trial=trial, commit=commit, status=evaluation.status,
+                    action="COMMITTED", metrics=metrics,
+                    evaluation=evaluation.to_dict(),
+                    editor_summary=editor_summary,
+                    runtime_seconds=result.duration_seconds, score=fit.score,
+                    referee_flags=trial_flag_dicts,
+                    editor_agent=seat_editor, evaluator_agent=seat_evaluator,
+                )
+                kg.record_trial(
+                    trial=trial, outcome=evaluation.status, action="COMMITTED",
+                    val_loss=fit.score, commit=commit,
+                    const_changes=const_changes, func_changes=func_changes,
+                    editor_summary=editor_summary,
+                    evaluator_reasoning=evaluation.reasoning,
+                )
+                pending_feedback = format_feedback(evaluation)
+                pending_diagnostic = ""
+                stagnation = 0
+                continue
+
+            # REGRESSED / CRASHED (or IMPROVED claimed on a crash) -> revert
+            try:
+                git.discard_changes()
+                remove_editor_debris()
+                warn(f"Changes reverted; workspace restored to "
+                     f"{git.short(git.head_commit())}.")
+            except GitError as exc:
+                error(f"Revert failed: {exc}. Attempting hard rollback to best "
+                      f"commit {git.short(best_commit)}.")
+                if best_commit:
+                    git.rollback_to(best_commit)
             logger.record_trial(
-                trial=trial, commit=commit, status=evaluation.status,
-                action="GOAL_COMMIT", metrics=metrics,
+                trial=trial, commit=None,
+                status=STATUS_CRASHED if crashed else evaluation.status,
+                action="REVERTED", metrics=metrics,
                 evaluation=evaluation.to_dict(),
                 editor_summary=editor_summary,
+                error_type=result.error_type,
                 runtime_seconds=result.duration_seconds, score=fit.score,
                 referee_flags=trial_flag_dicts,
                 editor_agent=seat_editor, evaluator_agent=seat_evaluator,
             )
+            # The failed change is reverted on disk, but it lives on in the
+            # knowledge graph as a dead-end fact so no future session (even a
+            # post-rotation one) repeats it.
             kg.record_trial(
-                trial=trial, outcome=evaluation.status, action="GOAL_COMMIT",
-                val_loss=fit.score, commit=commit,
-                const_changes=const_changes, func_changes=func_changes,
-                editor_summary=editor_summary,
+                trial=trial,
+                outcome=STATUS_CRASHED if crashed else evaluation.status,
+                action="REVERTED", val_loss=fit.score,
+                commit=None, const_changes=const_changes,
+                func_changes=func_changes, editor_summary=editor_summary,
                 evaluator_reasoning=evaluation.reasoning,
             )
-            final_result = "GOAL_REACHED"
-            break
-
-        if evaluation.status == STATUS_IMPROVED and not crashed:
-            commit = git.commit_trial(trial, fit.score,
-                                      metric_name=metric_name)
-            best_metrics = metrics
-            best_score = fit.score
-            best_commit = commit
-            success(f"Improvement committed as {git.short(commit)} "
-                    f"(experiment(trial-{trial}): "
-                    f"{metric_name}={fit.score:.4f}).")
-            logger.record_trial(
-                trial=trial, commit=commit, status=evaluation.status,
-                action="COMMITTED", metrics=metrics,
-                evaluation=evaluation.to_dict(),
-                editor_summary=editor_summary,
-                runtime_seconds=result.duration_seconds, score=fit.score,
-                referee_flags=trial_flag_dicts,
-                editor_agent=seat_editor, evaluator_agent=seat_evaluator,
-            )
-            kg.record_trial(
-                trial=trial, outcome=evaluation.status, action="COMMITTED",
-                val_loss=fit.score, commit=commit,
-                const_changes=const_changes, func_changes=func_changes,
-                editor_summary=editor_summary,
-                evaluator_reasoning=evaluation.reasoning,
-            )
+            graph_state["current"] = CodeGraph.build(workdir)  # reverted state
+            graph_state["current"].save(code_graph_path)
             pending_feedback = format_feedback(evaluation)
-            pending_diagnostic = ""
-            stagnation = 0
-            continue
+            if all_flags:
+                pending_feedback += ("\n\n## Referee flags on your trial\n"
+                                     + Referee.render(all_flags))
+            pending_diagnostic = crash_diagnostic
+            stagnation += 1
+            if crashed:
+                pending_feedback += (
+                    "\n\nNOTE: your previous edit was REVERTED because the run "
+                    "crashed — the workspace is back at the last good state. "
+                    "Try a DIFFERENT approach; do not repeat the same edit."
+                )
+            else:
+                pending_feedback += (
+                    "\n\nNOTE: your previous edit was REVERTED because it "
+                    "regressed performance. Try an orthogonal approach."
+                )
 
-        # REGRESSED / CRASHED (or IMPROVED claimed on a crash) -> revert
-        try:
-            git.discard_changes()
-            remove_editor_debris()
-            warn(f"Changes reverted; workspace restored to "
-                 f"{git.short(git.head_commit())}.")
-        except GitError as exc:
-            error(f"Revert failed: {exc}. Attempting hard rollback to best "
-                  f"commit {git.short(best_commit)}.")
-            if best_commit:
-                git.rollback_to(best_commit)
-        logger.record_trial(
-            trial=trial, commit=None,
-            status=STATUS_CRASHED if crashed else evaluation.status,
-            action="REVERTED", metrics=metrics,
-            evaluation=evaluation.to_dict(),
-            editor_summary=editor_summary,
-            error_type=result.error_type,
-            runtime_seconds=result.duration_seconds, score=fit.score,
-            referee_flags=trial_flag_dicts,
-            editor_agent=seat_editor, evaluator_agent=seat_evaluator,
-        )
-        # The failed change is reverted on disk, but it lives on in the
-        # knowledge graph as a dead-end fact so no future session (even a
-        # post-rotation one) repeats it.
-        kg.record_trial(
-            trial=trial,
-            outcome=STATUS_CRASHED if crashed else evaluation.status,
-            action="REVERTED", val_loss=fit.score,
-            commit=None, const_changes=const_changes,
-            func_changes=func_changes, editor_summary=editor_summary,
-            evaluator_reasoning=evaluation.reasoning,
-        )
-        graph_state["current"] = CodeGraph.build(workdir)  # reverted state
-        graph_state["current"].save(code_graph_path)
-        pending_feedback = format_feedback(evaluation)
-        if all_flags:
-            pending_feedback += ("\n\n## Referee flags on your trial\n"
-                                 + Referee.render(all_flags))
-        pending_diagnostic = crash_diagnostic
-        stagnation += 1
-        if crashed:
-            pending_feedback += (
-                "\n\nNOTE: your previous edit was REVERTED because the run "
-                "crashed — the workspace is back at the last good state. "
-                "Try a DIFFERENT approach; do not repeat the same edit."
-            )
-        else:
-            pending_feedback += (
-                "\n\nNOTE: your previous edit was REVERTED because it "
-                "regressed performance. Try an orthogonal approach."
-            )
+    except KeyboardInterrupt:
+        interrupted = True
+        final_result = "INTERRUPTED"
+        print()
+        warn("Interrupted — finishing the session record; the working "
+             "tree is left exactly as it is.")
 
     # ---- Wrap-up -----------------------------------------------------------
     phase("Session complete")
@@ -1218,6 +1315,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     info(f"Summary report: {report}")
     info("Full history: experiments_history.json")
 
+    if interrupted:
+        try:
+            leftover = git.changed_files()
+        except GitError:
+            leftover = []
+        if leftover:
+            warn("Uncommitted changes from the interrupted trial are still "
+                 "in your working tree:")
+            for f in leftover[:10]:
+                info(f"  {f}")
+            info("Keep them, or discard with: git checkout -- . && "
+                 "git clean -fd")
+        else:
+            info("Working tree is clean.")
+        return 130
+
     if final_result == "GOAL_REACHED":
         success("Experiment goal reached. 🎯")
         return 0
@@ -1226,8 +1339,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-        sys.exit(130)
+    sys.exit(main())

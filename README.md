@@ -201,6 +201,7 @@ uv run --project /path/to/ml_orchestrator ml-orchestrator \
 | `--eval-command` | preset-dependent | Shell command measuring the objective each trial (`pytest -q`, `npm test`, `python train.py`...). |
 | `--direction` | from preset | `minimize` or `maximize` the score. |
 | `--goal-target` | parsed from goal | Explicit numeric goal for the score. |
+| `--goal-op` | derived | Comparison used to test the goal (`<`, `<=`, `>`, `>=`). Rarely needed — see below. |
 | `--scaffold-demo` | off | Drop the bundled demo train.py/model into the workspace first. |
 | `--max-trials` | `5` | Maximum edit→train→evaluate iterations. |
 | `--train-script` | `train.py` | Script executed each trial via `--python`. |
@@ -222,6 +223,34 @@ uv run --project /path/to/ml_orchestrator ml-orchestrator \
 | `--context-limit` | `1000000` | Model context window in tokens (Claude Code 1M-context model). |
 | `--rotate-at` | `0.5` | Fraction of the context limit at which a session is closed & reborn with a memory snapshot. |
 | `--memory-dir` | `.agent_memory` | Directory (inside the workdir) for snapshots, archives and live session state. |
+
+### How the goal condition is decided
+
+One place owns the comparison; three inputs feed it, in increasing
+precedence:
+
+1. **The preset** — `ml` is `val_loss < target`, `coding` is
+   `failing_tests <= 0`.
+2. **The goal text** — a numeric condition in `--goal` sets the target
+   *and* the operator *and* the direction. `--goal "Achieve score >= 0.9"`
+   is a maximize run; `--goal "validation loss < 0.25"` is a minimize one.
+3. **Flags** — `--goal-target`, then `--direction` (which flips the
+   operator to match, preserving strictness), then `--goal-op` for full
+   manual control.
+
+The resolved condition is printed at startup, e.g.
+`Numeric goal condition: val_loss < 0.25 (minimize; from goal text)`.
+Check that line before a long run — it is the exact test used to declare
+`GOAL_REACHED`.
+
+## Interrupting a run
+
+`Ctrl-C` finishes the session record rather than aborting mid-write: the
+history is closed as `INTERRUPTED`, the markdown report is still
+generated, and the working tree is **left exactly as it is**. Any
+uncommitted changes from the trial in flight are listed on exit, along
+with the command to discard them. Nothing is auto-reverted — interrupting
+is usually deliberate. Exit code is `130`.
 
 ## Evaluator response schema
 
@@ -288,25 +317,46 @@ so memory artifacts never pollute experiment diffs.
   proposal for the next change; identities are scrubbed and labels
   shuffled; every agent then scores all candidates 1-10 against a fixed
   rubric. Highest mean takes the **Editor** seat and implements its own
-  proposal; the runner-up takes the **Evaluator** seat. Re-runs at
-  start, after 2 commit-less trials, and optionally every N trials.
-  The judge decides *who drives* — commits/reverts are still decided
-  only by the objective fitness signal.
-- **Referee (deterministic watchdog).** Pure rules, not an LLM:
-  modifying test files in coding mode is CRITICAL and force-reverted
-  before any run is wasted; verdicts that contradict the numbers are
-  downgraded (numeric truth wins); metrics-file fabrication, repeated
-  dead ends and suspicious jumps are flagged into the history, the
-  editor's feedback, and the next tournament's judging context.
+  proposal; the runner-up takes the **Evaluator** seat. The judge
+  decides *who drives* — commits/reverts are still decided only by the
+  objective fitness signal.
+  - **Self-scores are dropped** once at least 3 judges respond: a judge
+    rating its own anonymized candidate is the one bias blind labelling
+    cannot remove. Below 3 judges the rule is off, so a two-agent panel
+    never collapses to a single voter.
+  - **Re-runs** happen at start, on stagnation, and optionally every N
+    trials (`--tournament-every`). The stagnation trigger requires the
+    knowledge graph to have gained facts since the last tournament, and
+    its threshold backs off (2 → 4 → 8): rotating the driver when stuck
+    is the point, but re-ranking the same unchanged context at 2N CLI
+    calls a round is not.
+- **Referee (deterministic watchdog).** Pure rules, not an LLM.
+  - `TEST_TAMPERING` (CRITICAL) — modifying test files in coding mode is
+    force-reverted before any run is wasted.
+  - `VERDICT_ON_CRASH` / `VERDICT_CONTRADICTION` / `PREMATURE_GOAL` —
+    verdicts that contradict the numbers are downgraded; numeric truth
+    wins.
+  - `METRIC_FABRICATION` (WARN) — the ml-preset counterpart of test
+    tampering: an edit that writes a *hardcoded* objective value
+    (`json.dump({"val_loss": 0.001}, ...)`) instead of measuring one.
+  - `RUNTIME_COLLAPSE` (WARN) — the objective improved while the run got
+    ≥10× shorter than the baseline, which is fabrication-shaped. Early
+    stopping and caching do this legitimately, hence WARN.
+  - `METRICS_TAMPERING`, `REPEATED_DEAD_END`, `SUSPICIOUS_JUMP` — flagged
+    into the history, the editor's feedback and the next tournament's
+    judging context. `SUSPICIOUS_JUMP` is suppressed once the goal
+    condition is met, since reaching the target *is* the terminal event.
 - **Haskell decision kernel (`haskell/`).** The judge aggregation and
   referee rules — the trust-critical decision core — are canonically
   implemented as a pure Haskell binary (`mao-kernel`, JSON in/out).
   The orchestrator uses it when found (`$MAO_KERNEL` or PATH) and
-  falls back to a behavior-identical Python implementation otherwise;
-  both are pinned to the same golden vectors
-  (`tests/kernel_vectors.json`), so `uvx ml-agent-orchestrator` still
-  works with zero extra toolchain. Build instructions:
-  [`docs/judge-referee.md`](docs/judge-referee.md).
+  falls back to a behavior-identical Python implementation otherwise,
+  so `uvx ml-agent-orchestrator` works with zero extra toolchain.
+  Parity is *tested*, not asserted: the shared path corpus
+  (`tests/test_paths.json`) generates one parity vector per case, and
+  the vector runner exercises the production Python functions rather
+  than a copy, so neither implementation can drift alone. Build
+  instructions: [`docs/judge-referee.md`](docs/judge-referee.md).
 
 ## Built-in knowledge graphs (v0.3)
 
@@ -356,26 +406,10 @@ knows the codebase and the full experiment history from message one.
 
 ### Going further: external graph-memory projects
 
-For even richer memory (semantic search, multi-project graphs), these
-open-source projects slot in cleanly — most are MCP servers, which
-Claude Code can use even in print mode after a one-time
-`claude mcp add <name> ...`:
-
-| Project | What it gives you |
-|---------|-------------------|
-| [`shaneholloman/mcp-knowledge-graph`](https://github.com/shaneholloman/mcp-knowledge-graph) | Local knowledge-graph memory MCP (entities/relations/observations) — the classic "remember across sessions" server. |
-| [`DeusData/codebase-memory-mcp`](https://github.com/DeusData/codebase-memory-mcp) | Indexes the repo into a persistent code knowledge graph (tree-sitter, 158 languages) so structural questions cost ~99% fewer tokens than re-reading files. |
-| [`getzep/graphiti`](https://github.com/getzep/graphiti) | Temporal knowledge graphs for agents — facts carry validity intervals, ideal for "what worked, then stopped working" experiment history. |
-| [`topoteretes/cognee`](https://github.com/topoteretes/cognee) | Pipeline that turns documents/history into a queryable semantic graph ("memory engine") with a few lines of Python. |
-| [`mem0ai/mem0`](https://github.com/mem0ai/mem0) | Lightweight self-improving memory layer with an MCP server; good for preference/feedback-style memories. |
-| [`doobidoo/mcp-memory-service`](https://github.com/doobidoo/mcp-memory-service) | Semantic memory MCP with time-based recall and tagging. |
-
-Integration points: (1) register a memory MCP server with Claude Code
-and tell the Editor (via `--claude-cmd` extra flags or CLAUDE.md) to
-store/query it; (2) replace `core/session.py::MemoryStore` with an
-adapter that writes snapshots into one of these graphs instead of
-markdown — the `ManagedSession` API (`save_snapshot` /
-`render_preamble` / `load_state` / `save_state`) is the only contract.
+The built-in graphs need no external services. For richer memory
+(semantic search, multi-project graphs) several MCP servers slot in
+cleanly — see [`docs/memory-integrations.md`](docs/memory-integrations.md)
+for the options and the two integration points.
 
 ## Artifacts
 
@@ -429,8 +463,12 @@ multi-agent-orchestrator/
 │   │   └── logger.py          # experiments_history.json + markdown report
 │   └── templates/             # bundled demo (used by --scaffold-demo)
 ├── haskell/                   # mao-kernel: canonical judge/referee decision kernel
-├── docs/judge-referee.md      # harness design: tournament, referee, kernel protocol
+├── docs/
+│   ├── judge-referee.md       # harness design: tournament, referee, kernel protocol
+│   └── memory-integrations.md # optional external graph-memory servers
 ├── tests/                     # runnable suites: uv run python tests/run_all.py
+│   ├── kernel_vectors.json    # golden vectors: Haskell kernel <-> Python parity
+│   └── test_paths.json        # shared test-path corpus (generates parity vectors)
 ├── requirements.txt           # legacy pip fallback only
 └── README.md
 ```

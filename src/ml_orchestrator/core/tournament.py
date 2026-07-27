@@ -149,6 +149,73 @@ REASON: <one paragraph justifying the ranking>"""
 
 
 # ---------------------------------------------------------------------------
+# Aggregation — the canonical Python implementation
+# ---------------------------------------------------------------------------
+#
+# SPEC (mirrored by the `aggregate` op in haskell/src/Main.hs; both are
+# pinned to tests/kernel_vectors.json — change one, change all three):
+#
+# 1. exclude_self := (number of judges that returned scores) >= 3.
+# 2. For each label L in `labels` with an owner A = label_map[L]:
+#      vals := scores for L from every judge except (when exclude_self) A
+#      if vals is empty: vals := scores for L from every judge  [fallback]
+#      if vals is still empty: skip L entirely
+#      mean[A] := sum(vals) / len(vals)
+# 3. ranking := means sorted by score descending, STABLY, with the
+#    underlying order being `labels` order.
+# 4. winner := the incumbent if it is tied at the top, else the first
+#    agent in the tied-at-top group.
+# 5. evaluator := the highest-ranked agent that is not the winner
+#    (the winner itself when it is the only one).
+#
+# Rule 1 exists because a judge scoring its own anonymized candidate is
+# the one systematic bias blind labelling cannot remove. It is gated at
+# 3 judges so that a two-agent panel does not collapse to a single
+# voter. The rule-2 fallback guarantees exclusion can never make a
+# candidate vanish from the ranking when only its owner scored it.
+
+def aggregate_scores(
+    labels: Sequence[str],
+    label_map: Dict[str, str],
+    judge_scores: Dict[str, Dict[str, float]],
+    incumbent: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Aggregate a judge panel into a ranking and seat assignment.
+
+    Returns None when no label received a usable score. This is the
+    implementation the orchestrator, the test harness and the kernel
+    golden vectors all exercise — do not inline a second copy.
+    """
+    exclude_self = len(judge_scores) >= 3
+    means: Dict[str, float] = {}
+    for label in labels:
+        owner = label_map.get(label)
+        if owner is None:
+            continue
+        scored = [(judge, s[label]) for judge, s in judge_scores.items()
+                  if label in s]
+        vals = [v for judge, v in scored
+                if not (exclude_self and judge == owner)]
+        if not vals:  # only the owner scored it — keep the candidate alive
+            vals = [v for _, v in scored]
+        if not vals:
+            continue
+        means[owner] = sum(vals) / len(vals)
+    if not means:
+        return None
+    ranking = sorted(means.items(), key=lambda kv: kv[1], reverse=True)
+    top_score = ranking[0][1]
+    tied = [a for a, s in ranking if abs(s - top_score) < 1e-9]
+    winner = incumbent if incumbent in tied else tied[0]
+    others = [a for a, _ in ranking if a != winner]
+    return {
+        "ranking": [[a, s] for a, s in ranking],
+        "winner": winner,
+        "evaluator": others[0] if others else winner,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
@@ -301,20 +368,16 @@ def run_tournament(
         winner = str(resp["winner"])
         notes.append("aggregation: haskell kernel")
     else:
-        means: Dict[str, float] = {}
-        for label in labels:
-            vals = [s[label] for s in judge_scores.values() if label in s]
-            if vals:
-                means[label_map[label]] = sum(vals) / len(vals)
-        if not means:
+        agg = aggregate_scores(labels, label_map, judge_scores, incumbent)
+        if agg is None:
             return None
-        ranking = sorted(means.items(), key=lambda kv: kv[1], reverse=True)
-        # Tie-break: prefer the incumbent (stability), then ranking order.
-        top_score = ranking[0][1]
-        tied = [a for a, s in ranking if abs(s - top_score) < 1e-9]
-        winner = incumbent if incumbent in tied else tied[0]
+        ranking = [(str(a), float(s)) for a, s in agg["ranking"]]
+        winner = str(agg["winner"])
+        notes.append("aggregation: python fallback")
     if not ranking or not winner:
         return None
+    if len(judge_scores) >= 3:
+        notes.append("self-scores excluded (>=3 judges)")
 
     others = [a for a, _ in ranking if a != winner]
     evaluator = others[0] if others else winner

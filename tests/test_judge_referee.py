@@ -9,13 +9,16 @@ import json
 import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 from ml_orchestrator.core import kernel
-from ml_orchestrator.core.referee import Referee, Flag, is_test_path
+from ml_orchestrator.core.referee import (
+    Referee, Flag, find_literal_metric_writes, is_test_path,
+)
 from ml_orchestrator.core.roster import default_roster, resolve_roster
 from ml_orchestrator.core.tournament import (
-    parse_scores, run_tournament, scrub_identity,
+    aggregate_scores, parse_scores, run_tournament, scrub_identity,
 )
 
 passed = failed = 0
@@ -200,13 +203,18 @@ check("NullStatus noop", True)
 
 # ---- referee -------------------------------------------------------------------
 print("== referee ==")
-check("test path detection",
-      all(is_test_path(p) for p in
-          ["tests/test_calc.py", "test_app.py", "src/foo_test.py",
-           "conftest.py", "e2e/button.spec.ts", "pkg/api.test.js"]))
-check("non-test paths",
-      not any(is_test_path(p) for p in
-              ["calc.py", "src/main.py", "contest.py", "latest_news.py"]))
+
+# The path corpus lives in test_paths.json so the SAME cases assert the
+# Python spec here and become generated kernel parity vectors below.
+PATH_CORPUS = json.loads(
+    (Path(__file__).parent / "test_paths.json").read_text())["paths"]
+
+path_mismatches = [
+    f"{e['path']} expected={e['test']} got={is_test_path(e['path'])}"
+    for e in PATH_CORPUS if is_test_path(e["path"]) != e["test"]
+]
+check(f"test path corpus ({len(PATH_CORPUS)} paths)",
+      not path_mismatches, "; ".join(path_mismatches[:4]))
 
 ref_c = Referee(mode="coding", metrics_filename="metrics.json")
 flags = ref_c.check_edit_phase(["calc.py", "tests/test_calc.py"], False)
@@ -233,6 +241,74 @@ flags = ref_ml.check_result_phase("IMPROVED", True, 0.01, 0.4, False, True)
 check("suspicious jump", any(f.code == "SUSPICIOUS_JUMP" for f in flags))
 flags = ref_ml.check_result_phase("IMPROVED", True, 0.35, 0.4, False, True)
 check("clean trial no flags", flags == [])
+
+# Reaching the goal is the terminal event, not a suspicious one.
+flags = ref_ml.check_result_phase("GOAL_REACHED", True, 0.0, 5.0,
+                                  goal_met=True, is_better=True)
+check("jump suppressed when goal met",
+      not any(f.code == "SUSPICIOUS_JUMP" for f in flags), flags)
+flags_c = Referee(mode="coding", metrics_filename="metrics.json") \
+    .check_result_phase("GOAL_REACHED", True, 0.0, 10.0,
+                        goal_met=True, is_better=True)
+check("coding N->0 failures not flagged", flags_c == [], flags_c)
+
+# Runtime collapse: improving while the run got 10x shorter.
+flags = ref_ml.check_result_phase("IMPROVED", True, 0.1, 0.4, False, True,
+                                  duration_seconds=2.0,
+                                  baseline_duration_seconds=120.0)
+check("runtime collapse", any(f.code == "RUNTIME_COLLAPSE"
+                              and f.severity == "WARN" for f in flags))
+flags = ref_ml.check_result_phase("IMPROVED", True, 0.35, 0.4, False, True,
+                                  duration_seconds=100.0,
+                                  baseline_duration_seconds=120.0)
+check("normal runtime not flagged",
+      not any(f.code == "RUNTIME_COLLAPSE" for f in flags))
+
+# ---- ml fabrication detector ----------------------------------------------------
+print("== metric fabrication ==")
+with tempfile.TemporaryDirectory() as _td:
+    td = Path(_td)
+    (td / "honest.py").write_text(
+        "import json\n"
+        "def train():\n"
+        "    val_loss = 0.0\n"          # accumulator init: must NOT fire
+        "    for x in range(3):\n"
+        "        val_loss += x\n"
+        "    json.dump({'val_loss': val_loss}, open('metrics.json', 'w'))\n"
+    )
+    (td / "direct.py").write_text(
+        "import json\n"
+        "json.dump({'val_loss': 0.001, 'status': 'COMPLETED'}, "
+        "open('metrics.json', 'w'))\n"
+    )
+    (td / "indirect.py").write_text(
+        "import json\n"
+        "metrics = {'epoch': 30, 'val_loss': 0.002}\n"
+        "json.dump(metrics, open('metrics.json', 'w'))\n"
+    )
+    (td / "stringly.py").write_text(
+        "from pathlib import Path\n"
+        "Path('metrics.json').write_text('{\"val_loss\": 0.003}')\n"
+    )
+    files = ["honest.py", "direct.py", "indirect.py", "stringly.py"]
+    found = find_literal_metric_writes(td, files)
+    hit = {f.split(":")[0] for f in found}
+    check("accumulator init not flagged", "honest.py" not in hit, found)
+    check("literal dict dumped", "direct.py" in hit, found)
+    check("literal dict via variable", "indirect.py" in hit, found)
+    check("literal in a string write", "stringly.py" in hit, found)
+
+    ml_flags = ref_ml.check_edit_phase(files, False,
+                                       literal_metric_writes=found)
+    check("fabrication flagged as WARN",
+          any(f.code == "METRIC_FABRICATION" and f.severity == "WARN"
+              for f in ml_flags), ml_flags)
+    check("clean edit no fabrication flag",
+          not any(f.code == "METRIC_FABRICATION" for f in
+                  ref_ml.check_edit_phase(["honest.py"], False,
+                                          literal_metric_writes=
+                                          find_literal_metric_writes(
+                                              td, ["honest.py"]))))
 
 class FakeKG:
     def dead_ends(self):
@@ -268,38 +344,63 @@ vectors = json.loads(
     (Path(__file__).parent / "kernel_vectors.json").read_text())["vectors"]
 
 def python_kernel(request):
-    """Run a vector through the Python fallback implementations."""
+    """Run a vector through the PRODUCTION Python implementations.
+
+    This must never reimplement a rule. A previous version inlined its
+    own copy of the aggregation, so the vectors bound the Haskell kernel
+    to the test's arithmetic and left core/tournament.py unverified —
+    the same "asserted, not tested" failure the vectors exist to prevent.
+    """
     op = request["op"]
     if op == "aggregate":
-        labels = request["labels"]
-        label_map = request["label_map"]
-        judges = request["judge_scores"]
-        means = {}
-        for label in labels:
-            vals = [s[label] for s in judges.values() if label in s]
-            if vals:
-                means[label_map[label]] = sum(vals) / len(vals)
-        ranking = sorted(means.items(), key=lambda kv: kv[1], reverse=True)
-        top = ranking[0][1]
-        tied = [a for a, s in ranking if abs(s - top) < 1e-9]
-        incumbent = request.get("incumbent")
-        winner = incumbent if incumbent in tied else tied[0]
-        others = [a for a, _ in ranking if a != winner]
-        return {"winner": winner,
-                "evaluator": others[0] if others else winner,
-                "ranking": [[a, s] for a, s in ranking]}
+        return aggregate_scores(
+            request["labels"], request["label_map"],
+            request["judge_scores"], request.get("incumbent"),
+        ) or {}
     ref = Referee(mode=request.get("mode", "ml"),
                   metrics_filename=request.get("metrics_file", "metrics.json"),
                   direction=request.get("direction", "minimize"))
     if op == "review_edit":
-        flags = ref.check_edit_phase(request["changed_files"],
-                                     request["metrics_written"])
+        flags = ref.check_edit_phase(
+            request["changed_files"], request["metrics_written"],
+            literal_metric_writes=request.get("literal_metric_writes"))
     else:
         flags = ref.check_result_phase(
             request["status"], request["measured"], request["score"],
             request["best_score"], request["goal_met"],
-            request["is_better"], request.get("repeated_dead_end"))
+            request["is_better"], request.get("repeated_dead_end"),
+            duration_seconds=request.get("duration_seconds"),
+            baseline_duration_seconds=request.get(
+                "baseline_duration_seconds"))
     return {"flags": [f.to_dict() for f in flags]}
+
+
+def path_vectors():
+    """One review_edit parity vector per corpus path.
+
+    Generated rather than hand-written so that adding a case to
+    test_paths.json automatically checks BOTH implementations — the
+    structural fix for parity holes, not just the known ones.
+    """
+    out = []
+    for entry in PATH_CORPUS:
+        expected = [{"code": "TEST_TAMPERING", "severity": "CRITICAL"}] \
+            if entry["test"] else []
+        out.append({
+            "name": f"path[coding]: {entry['path']} -> "
+                    f"{'test' if entry['test'] else 'source'}",
+            "request": {
+                "op": "review_edit", "mode": "coding",
+                "metrics_file": "metrics.json",
+                "changed_files": [entry["path"]],
+                "metrics_written": False,
+            },
+            "expect": {"flags": expected},
+        })
+    return out
+
+
+vectors = vectors + path_vectors()
 
 def matches(expect, got, name):
     if "winner" in expect:

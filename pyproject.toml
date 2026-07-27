@@ -1,6 +1,6 @@
 [project]
 name = "ml-agent-orchestrator"
-version = "0.5.0"
+version = "0.6.0"
 description = "Closed-loop, self-improving agent engine: Claude Code, Google Antigravity and OpenAI Codex compete for the Editor seat via blind-tournament judging, a deterministic referee (Haskell decision kernel + verified Python fallback) polices the flow, and git + an objective fitness signal arbitrate every change. Persistent sessions, context-rotation memory, AST code graph, temporal experiment knowledge graph."
 readme = "README.md"
 requires-python = ">=3.10"
