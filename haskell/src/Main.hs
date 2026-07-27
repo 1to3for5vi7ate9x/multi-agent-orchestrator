@@ -116,8 +116,9 @@ aggregate req =
   let labels      = getStrings "labels" req
       labelMap    = getStrMap "label_map" req
       judges      = getScoreMap "judge_scores" req
-      incumbent   = getString "incumbent" req
-      excludeSelf = M.size judges >= 3
+      incumbent     = getString "incumbent" req
+      incumbentEval = getString "incumbent_evaluator" req
+      excludeSelf   = M.size judges >= 3
       scoresFor l = [ (judge, v)
                     | (judge, m) <- M.toList judges
                     , Just v <- [M.lookup l m] ]
@@ -140,16 +141,25 @@ aggregate req =
              winner = case incumbent of
                         Just inc | inc `elem` tied -> inc
                         _                          -> head tied
-             others = [a | (a, _) <- ranking, a /= winner]
-             evaluator = fromMaybe winner (safeHead others)
+             -- Rule 5: the evaluator seat also prefers its incumbent on
+             -- a tie. It owns a persistent, resumable session, so
+             -- churning it on a numeric tie discards a warm
+             -- conversation. No lexicographic fallback on purpose —
+             -- see the SPEC comment in core/tournament.py.
+             otherPairs = [(a, s) | (a, s) <- ranking, a /= winner]
+             evaluator = case otherPairs of
+               [] -> winner
+               ((firstOther, topOther) : _) ->
+                 let tiedOthers = [ a | (a, s) <- otherPairs
+                                      , abs (s - topOther) < 1e-9 ]
+                 in case incumbentEval of
+                      Just ie | ie `elem` tiedOthers -> ie
+                      _                              -> firstOther
          in object
               [ "ranking"   .= [[toJSON a, toJSON s] | (a, s) <- ranking]
               , "winner"    .= winner
               , "evaluator" .= evaluator
               ]
-  where
-    safeHead (x:_) = Just x
-    safeHead []    = Nothing
 
 -- ---------------------------------------------------------------------------
 -- review_edit — referee rules for the edit phase

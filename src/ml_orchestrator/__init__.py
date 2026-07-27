@@ -5,4 +5,4 @@ honest, and knowledge graphs + session memory keep the agents smart
 across trials and restarts.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"

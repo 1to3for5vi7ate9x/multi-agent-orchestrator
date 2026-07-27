@@ -129,6 +129,58 @@ res4 = run_tournament(agents=agents4, goal="g", trial=4,
 check("tie keeps incumbent", res4 is not None and res4.winner == "codex",
       res4 and res4.winner)
 
+# Evaluator-seat tie: self-exclusion makes second-place ties common (it
+# removed the self-inflation that used to separate them), and the seat
+# owns a persistent session. It must not be decided by label shuffling.
+def keyword_judge(prompt):
+    import re as _re
+    out = []
+    for label, block in _re.findall(
+            r"### Candidate (\w)\n(.*?)(?=### Candidate |\Z)",
+            prompt, _re.DOTALL):
+        out.append(f"{label}={9 if 'alpha' in block else 6}")
+    return "SCORES: " + " ".join(out) + "\nREASON: keyword."
+
+tie_agents = {
+    "claude": FakeAgent("claude", "CHANGE: alpha approach",
+                        judge_reply=keyword_judge),
+    "antigravity": FakeAgent("antigravity", "CHANGE: beta approach",
+                             judge_reply=keyword_judge),
+    "codex": FakeAgent("codex", "CHANGE: gamma approach",
+                       judge_reply=keyword_judge),
+}
+seats = set()
+for seed in range(8):
+    r = run_tournament(agents=tie_agents, goal="g", trial=2,
+                       knowledge_context="", history_summary="",
+                       last_feedback="", mode="ml", rng=random.Random(seed),
+                       incumbent="claude", incumbent_evaluator="codex")
+    seats.add((r.winner, r.evaluator))
+check("evaluator tie is shuffle-independent", seats == {("claude", "codex")},
+      seats)
+
+# Sanity: the tie really is a tie, so without an incumbent the seat is
+# whichever tied agent ranks first — arbitrary per run, by design.
+uncontrolled = set()
+for seed in range(8):
+    r = run_tournament(agents=tie_agents, goal="g", trial=2,
+                       knowledge_context="", history_summary="",
+                       last_feedback="", mode="ml", rng=random.Random(seed),
+                       incumbent="claude")
+    uncontrolled.add(r.evaluator)
+check("without an incumbent the tie falls to ranking order",
+      uncontrolled and uncontrolled <= {"antigravity", "codex"}, uncontrolled)
+
+# The seat must come FROM the aggregation, not be recomputed after it.
+agg = aggregate_scores(
+    ["A", "B", "C"], {"A": "antigravity", "B": "codex", "C": "claude"},
+    {"claude": {"A": 5, "B": 6, "C": 9},
+     "antigravity": {"A": 6, "B": 7, "C": 10},
+     "codex": {"A": 8, "B": 9, "C": 8}},
+    "claude", "codex")
+check("aggregate returns the tie-broken evaluator",
+      agg["winner"] == "claude" and agg["evaluator"] == "codex", agg)
+
 # ---- parallel gathering + live status --------------------------------------------
 print("== parallel tournament + status board ==")
 import threading
@@ -356,6 +408,7 @@ def python_kernel(request):
         return aggregate_scores(
             request["labels"], request["label_map"],
             request["judge_scores"], request.get("incumbent"),
+            request.get("incumbent_evaluator"),
         ) or {}
     ref = Referee(mode=request.get("mode", "ml"),
                   metrics_filename=request.get("metrics_file", "metrics.json"),

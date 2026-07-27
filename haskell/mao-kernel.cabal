@@ -1,6 +1,6 @@
 cabal-version:      2.4
 name:               mao-kernel
-version:            0.6.0
+version:            0.6.1
 synopsis:           Judge/referee decision kernel for ml-agent-orchestrator
 description:
   The trust-critical decision core of the ml-agent-orchestrator loop:

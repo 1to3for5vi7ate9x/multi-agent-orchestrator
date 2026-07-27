@@ -225,6 +225,66 @@
       }
     },
     {
+      "name": "aggregate: evaluator tie prefers the incumbent evaluator (real run, session e9e2b5f)",
+      "request": {
+        "op": "aggregate",
+        "labels": ["A", "B", "C"],
+        "label_map": {"A": "antigravity", "B": "codex", "C": "claude"},
+        "judge_scores": {
+          "claude": {"A": 5, "B": 6, "C": 9},
+          "antigravity": {"A": 6, "B": 7, "C": 10},
+          "codex": {"A": 8, "B": 9, "C": 8}
+        },
+        "incumbent": "claude",
+        "incumbent_evaluator": "codex"
+      },
+      "expect": {
+        "winner": "claude",
+        "evaluator": "codex",
+        "ranking": [["claude", 9.0], ["antigravity", 6.5], ["codex", 6.5]]
+      }
+    },
+    {
+      "name": "aggregate: evaluator tie with no incumbent falls to ranking order",
+      "request": {
+        "op": "aggregate",
+        "labels": ["A", "B", "C"],
+        "label_map": {"A": "antigravity", "B": "codex", "C": "claude"},
+        "judge_scores": {
+          "claude": {"A": 5, "B": 6, "C": 9},
+          "antigravity": {"A": 6, "B": 7, "C": 10},
+          "codex": {"A": 8, "B": 9, "C": 8}
+        },
+        "incumbent": "claude",
+        "incumbent_evaluator": null
+      },
+      "expect": {
+        "winner": "claude",
+        "evaluator": "antigravity",
+        "ranking": [["claude", 9.0], ["antigravity", 6.5], ["codex", 6.5]]
+      }
+    },
+    {
+      "name": "aggregate: incumbent evaluator not tied does not jump the ranking",
+      "request": {
+        "op": "aggregate",
+        "labels": ["A", "B", "C"],
+        "label_map": {"A": "antigravity", "B": "codex", "C": "claude"},
+        "judge_scores": {
+          "claude": {"A": 2, "B": 6, "C": 9},
+          "antigravity": {"A": 2, "B": 7, "C": 10},
+          "codex": {"A": 2, "B": 9, "C": 8}
+        },
+        "incumbent": "claude",
+        "incumbent_evaluator": "antigravity"
+      },
+      "expect": {
+        "winner": "claude",
+        "evaluator": "codex",
+        "ranking": [["claude", 9.0], ["codex", 6.5], ["antigravity", 2.0]]
+      }
+    },
+    {
       "name": "review_edit: hardcoded objective value flagged in ml mode",
       "request": {
         "op": "review_edit",

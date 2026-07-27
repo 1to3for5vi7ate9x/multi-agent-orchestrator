@@ -165,20 +165,31 @@ REASON: <one paragraph justifying the ranking>"""
 #    underlying order being `labels` order.
 # 4. winner := the incumbent if it is tied at the top, else the first
 #    agent in the tied-at-top group.
-# 5. evaluator := the highest-ranked agent that is not the winner
-#    (the winner itself when it is the only one).
+# 5. evaluator := the highest-ranked agent that is not the winner (the
+#    winner itself when it is the only one). When several are tied at
+#    that score, prefer `incumbent_evaluator`.
 #
 # Rule 1 exists because a judge scoring its own anonymized candidate is
 # the one systematic bias blind labelling cannot remove. It is gated at
 # 3 judges so that a two-agent panel does not collapse to a single
 # voter. The rule-2 fallback guarantees exclusion can never make a
 # candidate vanish from the ranking when only its owner scored it.
+#
+# Rule 5's incumbent preference mirrors rule 4's and exists for the same
+# reason plus a concrete one: the evaluator seat owns a persistent,
+# resumable session, so churning it on a numeric tie throws away a warm
+# conversation and starts cold. Note what is deliberately NOT here: a
+# lexicographic final fallback. When neither incumbent is tied, order
+# comes from the shuffled labels, which is arbitrary per run but
+# unbiased across runs — sorting by agent name instead would hand one
+# vendor a permanent structural advantage on every tie.
 
 def aggregate_scores(
     labels: Sequence[str],
     label_map: Dict[str, str],
     judge_scores: Dict[str, Dict[str, float]],
     incumbent: Optional[str] = None,
+    incumbent_evaluator: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Aggregate a judge panel into a ranking and seat assignment.
 
@@ -207,11 +218,20 @@ def aggregate_scores(
     top_score = ranking[0][1]
     tied = [a for a, s in ranking if abs(s - top_score) < 1e-9]
     winner = incumbent if incumbent in tied else tied[0]
-    others = [a for a, _ in ranking if a != winner]
+    other_pairs = [(a, s) for a, s in ranking if a != winner]
+    if not other_pairs:
+        evaluator = winner
+    else:
+        top_other = other_pairs[0][1]
+        tied_others = [a for a, s in other_pairs
+                       if abs(s - top_other) < 1e-9]
+        evaluator = (incumbent_evaluator
+                     if incumbent_evaluator in tied_others
+                     else other_pairs[0][0])
     return {
         "ranking": [[a, s] for a, s in ranking],
         "winner": winner,
-        "evaluator": others[0] if others else winner,
+        "evaluator": evaluator,
     }
 
 
@@ -283,6 +303,7 @@ def run_tournament(
     referee_notes: str = "",
     rng: Optional[random.Random] = None,
     incumbent: Optional[str] = None,
+    incumbent_evaluator: Optional[str] = None,
     log=lambda msg: None,
     status_factory: Optional[Callable[[str, List[str]], Any]] = None,
 ) -> Optional[TournamentResult]:
@@ -356,31 +377,43 @@ def run_tournament(
     # Canonical path: the Haskell decision kernel (fail-open to Python).
     ranking: List[Tuple[str, float]] = []
     winner = ""
+    evaluator = ""
     resp = kernel.call({
         "op": "aggregate",
         "labels": list(labels),
         "label_map": label_map,
         "judge_scores": judge_scores,
         "incumbent": incumbent,
+        "incumbent_evaluator": incumbent_evaluator,
     })
     if resp and resp.get("ranking") and resp.get("winner"):
         ranking = [(str(a), float(s)) for a, s in resp["ranking"]]
         winner = str(resp["winner"])
+        evaluator = str(resp.get("evaluator") or "")
         notes.append("aggregation: haskell kernel")
     else:
-        agg = aggregate_scores(labels, label_map, judge_scores, incumbent)
+        agg = aggregate_scores(labels, label_map, judge_scores, incumbent,
+                               incumbent_evaluator)
         if agg is None:
             return None
         ranking = [(str(a), float(s)) for a, s in agg["ranking"]]
         winner = str(agg["winner"])
+        evaluator = str(agg["evaluator"])
         notes.append("aggregation: python fallback")
     if not ranking or not winner:
         return None
     if len(judge_scores) >= 3:
         notes.append("self-scores excluded (>=3 judges)")
 
-    others = [a for a, _ in ranking if a != winner]
-    evaluator = others[0] if others else winner
+    # The seat assignment comes FROM the aggregation, kernel or Python.
+    # It used to be recomputed here, which silently discarded the
+    # `evaluator` both implementations return and the vectors pin — so
+    # the tie-break rule would have had no effect on the live loop.
+    # The recompute survives only as a guard against a kernel that
+    # omits the field entirely.
+    if not evaluator:
+        others = [a for a, _ in ranking if a != winner]
+        evaluator = others[0] if others else winner
     winning_proposal = next(
         p.text for p in proposals if p.agent == winner)
 

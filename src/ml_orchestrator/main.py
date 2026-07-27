@@ -871,6 +871,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         f"- [{f['severity']}] {f['code']}: {f['detail']}"
                         for f in recent_flags[-8:]),
                     incumbent=seat_editor,
+                    incumbent_evaluator=seat_evaluator,
                     log=info,
                     status_factory=LiveStatus,
                 )
