@@ -18,36 +18,42 @@ Two presets share one loop:
   `--eval-command` (`pytest -q`, `npm test`, ...) — goal reached when
   the suite is green.
 
-- **Claude Code** acts as the **Model & Experiment Editor** — it edits your
-  `model.py` / `train.py` (architecture, training loop, hyperparameters,
-  preprocessing) directly on disk.
-- **Google Antigravity CLI** (`agy`) acts as the **Research & Evaluation
-  Specialist** — it reads `metrics.json`, terminal logs and the trial
-  history, and returns a strict, parseable scientific verdict.
+- The **Editor seat** edits your source on disk — `model.py` / `train.py`
+  (architecture, training loop, hyperparameters) in the ml preset, any
+  non-test source in the coding preset.
+- The **Evaluator seat** reads `metrics.json`, terminal logs and the trial
+  history, and returns a strict, parseable verdict.
+- **Seats are won, not assigned**: a blind tournament ranks anonymous
+  proposals and the winner drives (`--no-rotate` pins the old static
+  seats). Any installed agent can play either seat.
 - **Git** is the state machine — improvements are committed automatically,
   regressions and crashes are reverted automatically.
 
 ```
-        ┌────────────────────────────────────────────────────┐
-        │                     Orchestrator                   │
-        └────────────────────────────────────────────────────┘
-   ┌──────────┐    ┌──────────────┐    ┌──────────────┐    ┌─────────┐
-   │  Claude  │───▶│  Sandboxed   │───▶│ Antigravity  │───▶│   Git   │
-   │  Editor  │    │ training run │    │  Evaluator   │    │ decide  │
-   └──────────┘    │ + metrics.json│   └──────────────┘    └─────────┘
-        ▲          └──────────────┘                             │
-        │            feedback / crash diagnostics / history     │
-        └───────────────────────────────────────────────────────┘
+   ┌───────────────────────────────────────────────────────────────────┐
+   │   Blind tournament assigns the seats · referee polices the flow   │
+   └───────────────────────────────────────────────────────────────────┘
+
+   ┌────────────┐   ┌──────────────┐   ┌──────────────┐   ┌────────────┐
+   │   Editor   │──▶│  Sandboxed   │──▶│  Evaluator   │──▶│    Git     │
+   │    seat    │   │   eval run   │   │     seat     │   │  decides   │
+   └────────────┘   └──────────────┘   └──────────────┘   └────────────┘
+          ▲                                                     │
+          │   feedback / diagnostics / knowledge-graph facts    │
+          └─────────────────────────────────────────────────────┘
 ```
 
 Per trial:
-1. **Edit** — Claude modifies the editable source files toward the goal.
-2. **Run** — the training script executes in a monitored subprocess with a
-   hard timeout; CUDA OOM, shape mismatches, syntax errors, NaN losses etc.
-   are auto-classified into actionable diagnostics.
-3. **Evaluate** — Antigravity analyzes loss curves, convergence, train/val
-   gap, stability and GPU memory, replying in a strict schema.
-4. **Decide** —
+1. **Edit** — the Editor seat modifies the editable source toward the goal.
+2. **Run** — the evaluation command executes in a monitored subprocess with
+   a hard timeout; CUDA OOM, shape mismatches, syntax errors, NaN losses
+   etc. are auto-classified into actionable diagnostics.
+3. **Evaluate** — the Evaluator seat analyzes the objective and its
+   dynamics (loss curves and train/val gap, or which tests still fail),
+   replying in a strict schema. With no second agent installed, a numeric
+   heuristic stands in.
+4. **Decide** — the referee arbitrates first (a verdict that contradicts
+   the numbers is downgraded; a tampered trial is force-reverted), then:
    - `GOAL_REACHED` → commit, write the summary report, exit 0.
    - `IMPROVED` → `git commit` tagged `experiment(trial-N): val_loss=...`,
      continue.
